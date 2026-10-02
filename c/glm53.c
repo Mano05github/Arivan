@@ -689,6 +689,7 @@ typedef struct {
     float *kda_scratch;
     int filled;                           /* posizioni gia' in cache */
     int cap;
+    uint64_t budget_bytes;
 } GSession;
 
 typedef struct {
@@ -707,9 +708,14 @@ typedef struct {
     int streaming;
     struct ERef *eref;
     struct LCache *ecache;
+    struct Slot *estage;                  /* bounded whole-model staging pool */
+    int estage_cap;
     int64_t e_len[6], e_at[6], e_slot;
     uint64_t clock, ebytes;
     long hits, miss;
+    ArivanMemoryProfile memory_profile;
+    ArivanMemoryBudget memory_budget;
+    int memory_active;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -1204,7 +1210,7 @@ typedef struct ERef {
 
 /* I sei pezzi non sono adiacenti nel file, ma non devono esserlo nemmeno in
  * memoria: expert_mats ci costruisce sopra solo tre viste in sola lettura. */
-typedef struct {
+typedef struct Slot {
     int eid;
     uint8_t *piece[GLM53_EXPERT_PIECES];
     uint8_t *own;
@@ -1213,6 +1219,30 @@ typedef struct {
     uint64_t used;
 } Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
+
+static int arivan_memory_telemetry_enabled(void) {
+    const char *setting = getenv("ARIVAN_MEMORY_TELEMETRY");
+    return setting && *setting && atoi(setting) != 0;
+}
+
+static void glm53_memory_report(const GModel *m, const char *event) {
+    if (!m->memory_active || !arivan_memory_telemetry_enabled()) return;
+    const ArivanMemoryBudget *b = &m->memory_budget;
+    fprintf(stderr,
+            "[ARIVAN MEMORY] event=%s phase=%s current=%.2fMiB peak=%.2fMiB "
+            "phase_peak=%.2fMiB limit=%.2fMiB available=%.2fMiB\n",
+            event, arivan_memory_phase_name(b->phase),
+            b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
+            b->peak_by_phase[b->phase] / 1048576.0,
+            b->limit_bytes / 1048576.0,
+            arivan_memory_available(b) / 1048576.0);
+}
+
+static void glm53_memory_set_phase(GModel *m, ArivanMemoryPhase phase) {
+    if (!m->memory_active || m->memory_budget.phase == phase) return;
+    arivan_memory_budget_set_phase(&m->memory_budget, phase);
+    glm53_memory_report(m, "phase");
+}
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
  * [moe_inter, hidden], down e' [hidden, moe_inter]: stessi byte, forme
@@ -1294,7 +1324,11 @@ static void expert_cache_init(GModel *m) {
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
     double budget;
-    if (setting) budget = atof(setting);
+    int force_staging = 0;
+    if (setting) {
+        budget = atof(setting);
+        force_staging = budget <= 0.0;
+    }
     else {
         const double free_now = memory_available_gb();
         budget = free_now - 3.0;
@@ -1306,9 +1340,16 @@ static void expert_cache_init(GModel *m) {
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
-    int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
-    if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
-    if (cap < 1) cap = 1;
+    int cap = force_staging ? 0
+                            : (int)((budget * 1e9) /
+                                    ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
+    const uint64_t slot_budget_bytes =
+        ((uint64_t)m->e_slot + 16383u) & ~(uint64_t)16383u;
+    if (g_cap_override > 0) {                          /* scelta esplicita: vince */
+        cap = g_cap_override;
+        force_staging = 0;
+    }
+    if (!force_staging && cap < 1) cap = 1;
     if (cap > c->n_experts) cap = c->n_experts;
 
     /* Arivan's profile is a hard whole-process ceiling, unlike the inherited
@@ -1319,52 +1360,59 @@ static void expert_cache_init(GModel *m) {
      * calling a profile successful and dying later in the first expert miss. */
     const char *profile_name = getenv("ARIVAN_MEMORY_PROFILE");
     if (profile_name && *profile_name) {
-        ArivanMemoryProfile profile;
-        ArivanMemoryBudget hard;
         uint64_t resident = 0;
-        if (arivan_memory_profile(profile_name, &profile) != 0) {
+        ArivanExpertPlan plan;
+        if (arivan_memory_profile(profile_name, &m->memory_profile) != 0) {
             fprintf(stderr, "ARIVAN_MEMORY_PROFILE=%s is unknown\n", profile_name);
             exit(2);
         }
+        m->memory_active = 1;
         resident = compat_peak_rss_bytes();
-        arivan_memory_budget_init(&hard, profile.engine_limit_bytes);
-        if (arivan_memory_reserve(&hard, ARIVAN_MEM_PERMANENT, resident) != 0) {
+        arivan_memory_budget_init(&m->memory_budget,
+                                  m->memory_profile.engine_limit_bytes);
+        if (arivan_memory_reserve(&m->memory_budget,
+                                  ARIVAN_MEM_PERMANENT, resident) != 0) {
             fprintf(stderr,
                     "[ARIVAN MEMORY] %s profile: resident load peak %.2f GiB already "
                     "exceeds the %.2f GiB engine ceiling; dense/vision paging is required\n",
-                    profile.name, resident / 1073741824.0,
-                    profile.engine_limit_bytes / 1073741824.0);
+                    m->memory_profile.name, resident / 1073741824.0,
+                    m->memory_profile.engine_limit_bytes / 1073741824.0);
             exit(1);
         }
-        uint64_t per_cap = (uint64_t)m->e_slot * (uint64_t)(sparse > 0 ? sparse : 1);
-        uint64_t allowed = profile.expert_cache_bytes;
-        uint64_t available = arivan_memory_available(&hard);
-        if (allowed > available) allowed = available;
-        uint32_t hard_cap = (uint32_t)cap;
-        int cache_status = 0;
-        if (sparse > 0)
-            cache_status = arivan_memory_reserve_uniform_cache(
-                &hard, ARIVAN_MEM_EXPERT_LRU, per_cap,
-                profile.expert_cache_bytes, (uint32_t)cap, 1, &hard_cap);
-        if (cache_status == 1) {
+        int plan_status = arivan_memory_plan_experts(
+            &m->memory_budget, slot_budget_bytes, (uint32_t)sparse,
+            m->memory_profile.expert_cache_bytes, (uint32_t)cap, 2, &plan);
+        if (plan_status == 1) {
             fprintf(stderr,
-                    "[ARIVAN MEMORY] %s profile leaves %.0f MiB for routed experts, "
-                    "but one slot across %d sparse layers needs %.0f MiB; "
-                    "the zero-cache staging path is not implemented yet\n",
-                    profile.name, allowed / 1048576.0, sparse, per_cap / 1048576.0);
+                    "[ARIVAN MEMORY] %s profile cannot fit one %.0f MiB "
+                    "expert staging slot below the %.2f GiB engine ceiling\n",
+                    m->memory_profile.name, slot_budget_bytes / 1048576.0,
+                    m->memory_profile.engine_limit_bytes / 1073741824.0);
             exit(1);
         }
-        if (cache_status != 0) {
+        if (plan_status != 0) {
             fprintf(stderr, "[ARIVAN MEMORY] invalid expert cache budget request\n");
             exit(1);
         }
-        cap = (int)hard_cap;
-        fprintf(stderr,
-                "[ARIVAN MEMORY] %s: load peak %.2f GiB, expert cap %d "
-                "(%.0f MiB), ceiling %.2f GiB\n",
-                profile.name, resident / 1073741824.0, cap,
-                ((uint64_t)cap * per_cap) / 1048576.0,
-                profile.engine_limit_bytes / 1073741824.0);
+        cap = (int)plan.cache_slots_per_layer;
+        m->estage_cap = (int)plan.staging_slots;
+        if (cap > 0)
+            fprintf(stderr,
+                    "[ARIVAN MEMORY] %s: load peak %.2f GiB, expert cache %d/layer "
+                    "(%.0f MiB), ceiling %.2f GiB\n",
+                    m->memory_profile.name, resident / 1073741824.0, cap,
+                    plan.cache_bytes / 1048576.0,
+                    m->memory_profile.engine_limit_bytes / 1073741824.0);
+        else
+            fprintf(stderr,
+                    "[ARIVAN MEMORY] %s: load peak %.2f GiB, zero-cache staging %d "
+                    "slot(s) (%.0f MiB), ceiling %.2f GiB\n",
+                    m->memory_profile.name, resident / 1073741824.0,
+                    m->estage_cap, plan.staging_bytes / 1048576.0,
+                    m->memory_profile.engine_limit_bytes / 1073741824.0);
+        glm53_memory_report(m, "load");
+    } else if (force_staging && sparse > 0) {
+        m->estage_cap = 2;
     }
 
     m->ecache = calloc((size_t)c->n_layers, sizeof(*m->ecache));
@@ -1372,14 +1420,30 @@ static void expert_cache_init(GModel *m) {
     for (int i = from; i < m->layer_end; i++) {
         LCache *cache = &m->ecache[i];
         cache->cap = cap;
-        cache->s = calloc((size_t)cap, sizeof(*cache->s));
-        if (!cache->s) { fprintf(stderr, "OOM allocating slots for layer %d\n", i); exit(1); }
-        for (int j = 0; j < cap; j++) cache->s[j].eid = -1;
+        if (cap > 0) {
+            cache->s = calloc((size_t)cap, sizeof(*cache->s));
+            if (!cache->s) { fprintf(stderr, "OOM allocating slots for layer %d\n", i); exit(1); }
+            for (int j = 0; j < cap; j++) cache->s[j].eid = -1;
+        }
     }
-    if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "experts: %.1f MB slots, %d per layer across %d sparse layers "
-                        "(%.1f GB resident)\n",
-                m->e_slot / 1e6, cap, sparse, (double)cap * sparse * m->e_slot / 1e9);
+    if (m->estage_cap > 0) {
+        m->estage = calloc((size_t)m->estage_cap, sizeof(*m->estage));
+        if (!m->estage) { fprintf(stderr, "OOM allocating expert staging slots\n"); exit(1); }
+        for (int j = 0; j < m->estage_cap; j++) m->estage[j].eid = -1;
+    }
+    if (getenv("GLM53_VERBOSE")) {
+        if (cap > 0)
+            fprintf(stderr,
+                    "experts: %.1f MB slots, %d per layer across %d sparse layers "
+                    "(%.1f GB resident)\n",
+                    m->e_slot / 1e6, cap, sparse,
+                    (double)cap * sparse * m->e_slot / 1e9);
+        else
+            fprintf(stderr,
+                    "experts: %.1f MB slots, zero persistent cache, %d staging slots "
+                    "shared by %d sparse layers\n",
+                    m->e_slot / 1e6, m->estage_cap, sparse);
+    }
 }
 
 static Slot *slot_find(GModel *m, int layer, int eid) {
@@ -1662,7 +1726,8 @@ static int glm53_expert_read_replica(GModel *m, const ERef *ref, int layer, int 
     return rep;
 }
 
-static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
+static void expert_read(GModel *m, int layer, int eid, Slot *slot,
+                        int force_owned) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
     int metal_slot = 0;
 #ifdef COLI_METAL
@@ -1676,7 +1741,7 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
      * 16-KiB-aligned base, so those views cannot be registered safely.
      * Metal-active slots therefore own one stable aligned slab; CPU-only runs
      * retain the zero-copy mmap fast path, using the selected replica. */
-    if (!metal_slot) {
+    if (!metal_slot && !force_owned) {
         int mapped_ok = 1;
         for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
             int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
@@ -1765,6 +1830,15 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
     Slot *slot = slot_find(m, layer, eid);
     if (slot) return slot;
     LCache *cache = &m->ecache[layer];
+    if (cache->cap == 0) {
+        if (!m->estage || m->estage_cap < 1) return NULL;
+        slot = &m->estage[m->clock % (uint64_t)m->estage_cap];
+        double t_read0 = now_s();
+        expert_read(m, layer, eid, slot, 1);
+        m->t_disk += now_s() - t_read0;
+        slot->used = ++m->clock;
+        return slot;
+    }
     if (cache->n < cache->cap) slot = &cache->s[cache->n++];
     else {
         int lru = 0;
@@ -1773,7 +1847,7 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
         slot = &cache->s[lru];
     }
     double t_read0 = now_s();
-    expert_read(m, layer, eid, slot);
+    expert_read(m, layer, eid, slot, 0);
     m->t_disk += now_s() - t_read0;
     slot->used = ++m->clock;
     return slot;
@@ -1905,6 +1979,44 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
 
     LCache *cache = &m->ecache[index];
+    if (cache->cap == 0) {
+        if (!m->estage || m->estage_cap < 1) {
+            fprintf(stderr, "zero-cache expert mode has no staging slot\n");
+            exit(1);
+        }
+        /* No expert survives beyond this loop. Two whole-model slots are
+         * allocated when the budget permits so asynchronous prefetch can be
+         * added without changing the memory contract; this first path keeps
+         * reads synchronous and alternates the reusable owned buffers. */
+        for (int i = 0; i < n_union; i++) {
+            const int eid = union_ids[i];
+            Slot *slot = &m->estage[i % m->estage_cap];
+            ehit_mark(m, index, eid);
+            const double t_read0 = now_s();
+            expert_read(m, index, eid, slot, 1);
+            m->t_disk += now_s() - t_read0;
+            slot->used = ++m->clock;
+
+            Mat gate, up, down;
+            expert_mats(m, slot, &gate, &up, &down);
+            for (int t = 0; t < tokens; t++) {
+                float scale = 0.0f;
+                for (int k = 0; k < topk; k++)
+                    if (chosen[(size_t)t * topk + k] == eid) {
+                        scale = weight[(size_t)t * topk + k];
+                        break;
+                    }
+                if (scale == 0.0f) continue;
+                mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
+                     c->swiglu_limit, sg, su);
+                float *dst = out + (size_t)t * c->hidden;
+                for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+            }
+        }
+        free(union_ids);
+        free(tmp); free(su); free(sg); free(weight); free(chosen);
+        return;
+    }
     const int block = cache->cap;
     int *slot_of = malloc((size_t)block * sizeof(int));
     int *to_read = malloc((size_t)block * sizeof(int));
@@ -1939,7 +2051,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 #endif
         for (int r = 0; r < reads; r++) {
             const int i = to_read[r];
-            expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
+            expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]], 0);
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
@@ -2281,6 +2393,7 @@ static void vision_load(GModel *m) {
  * buffer restituito. */
 static float *vision_encode(GModel *m, const float *patches,
                             int grid_h, int grid_w, int *out_tokens) {
+    glm53_memory_set_phase(m, ARIVAN_PHASE_VISION);
     if (!m->has_vision) {
         fprintf(stderr, "this checkpoint does not include the vision tower\n");
         exit(1);
@@ -2311,11 +2424,42 @@ static float *vision_encode(GModel *m, const float *patches,
 }
 
 /* ---------- sessione ---------- */
-static GSession *session_open(const GModel *m, int cap) {
+static uint64_t session_budget_bytes(const GModel *m, int cap) {
     const Cfg *c = &m->c;
+    uint64_t bytes = sizeof(GSession) +
+                     (uint64_t)c->n_layers * sizeof(GLayerState);
+    if (c->kda_proj)
+        bytes += (uint64_t)coli_kda_scratch_floats(
+                     c->kda_heads, c->kda_hd, c->kda_hd) * sizeof(float);
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i]) {
+            bytes += (uint64_t)cap *
+                     (uint64_t)(c->kv_lora + 2 * c->index_hd) * sizeof(float);
+        } else if (c->kda_proj) {
+            bytes += (uint64_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float);
+            bytes += (uint64_t)3 * c->kda_proj * c->conv_k * sizeof(float);
+        }
+    }
+    return bytes;
+}
+
+static GSession *session_open(GModel *m, int cap) {
+    const Cfg *c = &m->c;
+    glm53_memory_set_phase(m, ARIVAN_PHASE_PREFILL);
+    const uint64_t budget_bytes = session_budget_bytes(m, cap);
+    if (m->memory_active && arivan_memory_reserve(
+            &m->memory_budget, ARIVAN_MEM_KV_STATE, budget_bytes) != 0) {
+        fprintf(stderr,
+                "[ARIVAN MEMORY] %s profile cannot reserve %.2f MiB for "
+                "a %d-token session (%.2f MiB available)\n",
+                m->memory_profile.name, budget_bytes / 1048576.0, cap,
+                arivan_memory_available(&m->memory_budget) / 1048576.0);
+        exit(1);
+    }
     GSession *s = calloc(1, sizeof(*s));
     if (!s) { fprintf(stderr, "OOM allocating session\n"); exit(1); }
     s->cap = cap;
+    s->budget_bytes = m->memory_active ? budget_bytes : 0;
     s->layer = calloc((size_t)c->n_layers, sizeof(*s->layer));
     if (!s->layer) { fprintf(stderr, "OOM allocating layer states\n"); exit(1); }
     if (c->kda_proj)
@@ -2347,11 +2491,13 @@ static GSession *session_open(const GModel *m, int cap) {
                         "(%.2f GB at %d positions)\n",
                 per_token / 1024.0, full, per_token * cap / 1e9, cap);
     }
+    glm53_memory_report(m, "session-open");
     return s;
 }
 
-static void session_close(const GModel *m, GSession *s) {
+static void session_close(GModel *m, GSession *s) {
     if (!s) return;
+    const uint64_t budget_bytes = s->budget_bytes;
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
         free(st->latent); free(st->ikeys); free(st->igates);
@@ -2360,6 +2506,10 @@ static void session_close(const GModel *m, GSession *s) {
     free(s->kda_scratch);
     free(s->layer);
     free(s);
+    if (budget_bytes)
+        arivan_memory_release(&m->memory_budget, ARIVAN_MEM_KV_STATE,
+                              budget_bytes);
+    glm53_memory_report(m, "session-close");
 }
 
 /* I layer [begin, end) su `streams`, che entra e esce come H flussi residui
@@ -2471,6 +2621,10 @@ static void model_release(GModel *m) {
             free(cache->s);
         }
         free(m->ecache);
+    }
+    if (m->estage) {
+        for (int j = 0; j < m->estage_cap; j++) free(m->estage[j].own);
+        free(m->estage);
     }
     if (m->ehit) {
         for (int i = 0; i < m->c.n_layers; i++) free(m->ehit[i]);
@@ -2639,6 +2793,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  * che decide il token successivo. */
 static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                               const float *vision, int n_vision, int keep_all) {
+    glm53_memory_set_phase(m, ARIVAN_PHASE_PREFILL);
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
     int chunk = setting ? atoi(setting) : 128;
@@ -3335,6 +3490,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
+    glm53_memory_set_phase(m, ARIVAN_PHASE_DECODE);
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -3698,6 +3854,7 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     if (greedy > 0) {
+        glm53_memory_set_phase(&model, ARIVAN_PHASE_DECODE);
         int stops[8];
         const int n_stops = has_tokenizer ? load_stops(dir, stops, 8) : 0;
         /* Il costo per token misurato qui e non ricavato per sottrazione dal

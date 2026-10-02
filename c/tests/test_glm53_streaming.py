@@ -13,10 +13,10 @@ valori gia' dequantizzati, che il motore carica residenti. La quantizzazione e'
 avvenuta in entrambi, quindi l'unica differenza rimasta e' da dove arrivano i
 byte, e le risposte devono coincidere.
 
-Si esegue due volte sul contenitore int4: con un budget largo, dove ogni
-esperto si legge una volta sola, e con un budget da uno slot, dove la cache
-sbatte e gli stessi esperti vengono riletti in continuazione. Se il secondo
-giro rispondesse diverso, sarebbe l'eviction a sbagliare.
+Si esegue tre volte sul contenitore int4: con un budget largo, con un solo slot
+persistente per layer, e con cache zero. L'ultimo caso usa soltanto il pool di
+staging globale e rilegge ogni esperto; tutti e tre devono produrre gli stessi
+token del percorso residente.
 
 Il conteggio dei miss viene controllato perche' sia diverso da zero: un motore
 che avesse silenziosamente caricato tutto in RAM passerebbe ogni altro
@@ -73,11 +73,16 @@ def main() -> int:
     resident = run(arguments.binary, arguments.dequantized, patches, grid)
     wide = run(arguments.binary, arguments.quantized, patches, grid, budget="8")
     narrow = run(arguments.binary, arguments.quantized, patches, grid, budget="0.000001")
+    staged = run(arguments.binary, arguments.quantized, patches, grid, budget="0")
 
-    if "experts" not in wide or "experts" not in narrow:
+    if "experts" not in wide or "experts" not in narrow or "experts" not in staged:
         print("FAIL: il motore non ha usato lo streaming sul contenitore int4")
         return 1
-    misses = {"largo": int(wide["experts"][3]), "stretto": int(narrow["experts"][3])}
+    misses = {
+        "largo": int(wide["experts"][3]),
+        "stretto": int(narrow["experts"][3]),
+        "staging": int(staged["experts"][3]),
+    }
     if misses["largo"] < 1:
         print("FAIL: nessuna lettura da disco, gli esperti non sono stati streammati")
         return 1
@@ -85,8 +90,13 @@ def main() -> int:
         print(f"FAIL: con un solo slot i miss non aumentano "
               f"({misses['stretto']} contro {misses['largo']}): la cache non sfratta")
         return 1
+    if misses["staging"] < misses["largo"]:
+        print(f"FAIL: cache zero ha meno letture del budget largo "
+              f"({misses['staging']} contro {misses['largo']})")
+        return 1
 
-    for label, run_output in (("budget largo", wide), ("budget stretto", narrow)):
+    for label, run_output in (("budget largo", wide), ("budget stretto", narrow),
+                              ("cache zero", staged)):
         for field in ("teacher_forcing", "greedy"):
             if run_output[field] != resident[field]:
                 print(f"FAIL {field} con {label}\n"
@@ -96,7 +106,7 @@ def main() -> int:
 
     print(f"PASS GLM-5.3 streaming: stessi token dei pesi residenti, "
           f"{misses['largo']} letture col budget largo e {misses['stretto']} "
-          f"con un solo slot per layer")
+          f"con un solo slot per layer e {misses['staging']} con cache zero")
     return 0
 
 

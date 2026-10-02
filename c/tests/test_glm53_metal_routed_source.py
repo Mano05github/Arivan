@@ -13,7 +13,7 @@ class Glm53MetalRoutedSourceTests(unittest.TestCase):
         self.assertIn("metal_slot = g_metal_ready", SRC)
 
     def test_cpu_mmap_path_is_preserved(self):
-        self.assertIn("if (!metal_slot)", SRC)
+        self.assertIn("if (!metal_slot && !force_owned)", SRC)
         self.assertIn("st_map_shard_range", SRC)
         self.assertRegex(
             SRC,

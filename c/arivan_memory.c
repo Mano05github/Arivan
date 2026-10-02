@@ -35,8 +35,10 @@ void arivan_memory_budget_init(ArivanMemoryBudget *budget, uint64_t limit_bytes)
 }
 
 void arivan_memory_budget_set_phase(ArivanMemoryBudget *budget, ArivanMemoryPhase phase) {
-    if (!budget) return;
+    if (!budget || phase < 0 || phase >= ARIVAN_PHASE_COUNT) return;
     budget->phase = phase;
+    if (budget->current_bytes > budget->peak_by_phase[phase])
+        budget->peak_by_phase[phase] = budget->current_bytes;
 }
 
 int arivan_memory_reserve(ArivanMemoryBudget *budget, ArivanMemoryKind kind,
@@ -50,6 +52,8 @@ int arivan_memory_reserve(ArivanMemoryBudget *budget, ArivanMemoryKind kind,
     budget->by_kind[kind] += bytes;
     budget->current_bytes = next;
     if (next > budget->peak_bytes) budget->peak_bytes = next;
+    if (next > budget->peak_by_phase[budget->phase])
+        budget->peak_by_phase[budget->phase] = next;
     return 0;
 }
 
@@ -98,6 +102,52 @@ int arivan_memory_reserve_uniform_cache(ArivanMemoryBudget *budget,
     return 0;
 }
 
+int arivan_memory_plan_experts(ArivanMemoryBudget *budget,
+                               uint64_t bytes_per_expert,
+                               uint32_t sparse_layers,
+                               uint64_t cache_limit_bytes,
+                               uint32_t requested_cache_slots_per_layer,
+                               uint32_t requested_staging_slots,
+                               ArivanExpertPlan *plan) {
+    uint64_t bytes_per_layer_slot;
+    uint64_t staging_limit;
+    uint32_t granted = 0;
+    int status;
+
+    if (plan) memset(plan, 0, sizeof(*plan));
+    if (!budget || !plan || bytes_per_expert == 0 ||
+        (sparse_layers > 0 && requested_staging_slots == 0))
+        return -1;
+    if (sparse_layers == 0) return 0;
+
+    if (requested_cache_slots_per_layer > 0) {
+        if (bytes_per_expert > UINT64_MAX / sparse_layers) return -1;
+        bytes_per_layer_slot = bytes_per_expert * sparse_layers;
+        status = arivan_memory_reserve_uniform_cache(
+            budget, ARIVAN_MEM_EXPERT_LRU, bytes_per_layer_slot,
+            cache_limit_bytes, requested_cache_slots_per_layer, 1, &granted);
+        if (status < 0) return status;
+        if (status == 0) {
+            plan->cache_slots_per_layer = granted;
+            plan->cache_bytes = (uint64_t)granted * bytes_per_layer_slot;
+            return 0;
+        }
+    }
+
+    if (bytes_per_expert > UINT64_MAX / requested_staging_slots)
+        staging_limit = UINT64_MAX;
+    else
+        staging_limit = bytes_per_expert * requested_staging_slots;
+    if (staging_limit > cache_limit_bytes) staging_limit = cache_limit_bytes;
+    status = arivan_memory_reserve_uniform_cache(
+        budget, ARIVAN_MEM_EXPERT_STAGING, bytes_per_expert,
+        staging_limit, requested_staging_slots, 1, &granted);
+    if (status != 0) return status;
+    plan->staging_slots = granted;
+    plan->staging_bytes = (uint64_t)granted * bytes_per_expert;
+    return 0;
+}
+
 const char *arivan_memory_kind_name(ArivanMemoryKind kind) {
     static const char *const names[ARIVAN_MEM_KIND_COUNT] = {
         "permanent", "dense-window", "expert-staging", "expert-pinned",
@@ -109,6 +159,6 @@ const char *arivan_memory_kind_name(ArivanMemoryKind kind) {
 
 const char *arivan_memory_phase_name(ArivanMemoryPhase phase) {
     static const char *const names[] = {"load", "vision", "prefill", "decode"};
-    if (phase < ARIVAN_PHASE_LOAD || phase > ARIVAN_PHASE_DECODE) return "invalid";
+    if (phase < ARIVAN_PHASE_LOAD || phase >= ARIVAN_PHASE_COUNT) return "invalid";
     return names[phase];
 }

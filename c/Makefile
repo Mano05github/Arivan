@@ -1317,7 +1317,7 @@ tests/test_arivan_memory$(EXE): tests/test_arivan_memory.c arivan_memory.c ariva
 .PHONY: arivan-check
 arivan-check: tests/test_arivan_memory$(EXE)
 	./tests/test_arivan_memory$(EXE)
-	$(PYTHON) -m unittest tests/test_arivan_cli.py
+	$(PYTHON) -m unittest tests/test_arivan_cli.py tests/test_arivan_glm53_source.py
 
 tests/test_st_missing$(EXE): tests/test_st_missing.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

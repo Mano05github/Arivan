@@ -43,10 +43,18 @@ static void test_release_and_peak(void) {
 
 static void test_phase_and_names(void) {
     ArivanMemoryBudget budget;
-    arivan_memory_budget_init(&budget, 1);
+    arivan_memory_budget_init(&budget, 1000);
+    assert(arivan_memory_reserve(&budget, ARIVAN_MEM_PERMANENT, 100) == 0);
+    assert(budget.peak_by_phase[ARIVAN_PHASE_LOAD] == 100);
     arivan_memory_budget_set_phase(&budget, ARIVAN_PHASE_VISION);
     assert(budget.phase == ARIVAN_PHASE_VISION);
-    assert(arivan_memory_phase_name(budget.phase)[0] == 'v');
+    assert(budget.peak_by_phase[ARIVAN_PHASE_VISION] == 100);
+    assert(arivan_memory_reserve(&budget, ARIVAN_MEM_VISION, 250) == 0);
+    assert(budget.peak_by_phase[ARIVAN_PHASE_VISION] == 350);
+    assert(arivan_memory_release(&budget, ARIVAN_MEM_VISION, 250) == 0);
+    arivan_memory_budget_set_phase(&budget, ARIVAN_PHASE_DECODE);
+    assert(budget.peak_by_phase[ARIVAN_PHASE_DECODE] == 100);
+    assert(arivan_memory_phase_name(budget.phase)[0] == 'd');
     assert(arivan_memory_kind_name(ARIVAN_MEM_MTP)[0] == 'm');
 }
 
@@ -75,6 +83,47 @@ static void test_uniform_cache_refusal_is_transactional(void) {
     assert(budget.current_bytes == 0);
 }
 
+static void test_expert_plan_prefers_per_layer_cache(void) {
+    ArivanMemoryBudget budget;
+    ArivanExpertPlan plan;
+    arivan_memory_budget_init(&budget, 2000);
+    assert(arivan_memory_reserve(&budget, ARIVAN_MEM_PERMANENT, 200) == 0);
+    assert(arivan_memory_plan_experts(
+               &budget, 100, 4, 1200, 5, 2, &plan) == 0);
+    assert(plan.cache_slots_per_layer == 3);
+    assert(plan.staging_slots == 0);
+    assert(plan.cache_bytes == 1200);
+    assert(budget.by_kind[ARIVAN_MEM_EXPERT_LRU] == 1200);
+    assert(budget.by_kind[ARIVAN_MEM_EXPERT_STAGING] == 0);
+}
+
+static void test_expert_plan_falls_back_to_bounded_staging(void) {
+    ArivanMemoryBudget budget;
+    ArivanExpertPlan plan;
+    arivan_memory_budget_init(&budget, 1000);
+    assert(arivan_memory_reserve(&budget, ARIVAN_MEM_PERMANENT, 750) == 0);
+    assert(arivan_memory_plan_experts(
+               &budget, 120, 4, 500, 4, 2, &plan) == 0);
+    assert(plan.cache_slots_per_layer == 0);
+    assert(plan.staging_slots == 2);
+    assert(plan.staging_bytes == 240);
+    assert(budget.by_kind[ARIVAN_MEM_EXPERT_LRU] == 0);
+    assert(budget.by_kind[ARIVAN_MEM_EXPERT_STAGING] == 240);
+    assert(budget.current_bytes == 990);
+}
+
+static void test_expert_plan_refuses_when_one_staging_slot_does_not_fit(void) {
+    ArivanMemoryBudget budget;
+    ArivanExpertPlan plan;
+    arivan_memory_budget_init(&budget, 1000);
+    assert(arivan_memory_reserve(&budget, ARIVAN_MEM_PERMANENT, 900) == 0);
+    assert(arivan_memory_plan_experts(
+               &budget, 120, 4, 500, 4, 2, &plan) == 1);
+    assert(plan.cache_slots_per_layer == 0);
+    assert(plan.staging_slots == 0);
+    assert(budget.current_bytes == 900);
+}
+
 int main(void) {
     test_profiles();
     test_hard_limit_is_transactional();
@@ -82,6 +131,9 @@ int main(void) {
     test_phase_and_names();
     test_uniform_cache_clamps_and_reserves();
     test_uniform_cache_refusal_is_transactional();
+    test_expert_plan_prefers_per_layer_cache();
+    test_expert_plan_falls_back_to_bounded_staging();
+    test_expert_plan_refuses_when_one_staging_slot_does_not_fit();
     puts("arivan memory budget tests passed");
     return 0;
 }

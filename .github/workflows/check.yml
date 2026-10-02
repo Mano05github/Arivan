@@ -126,6 +126,7 @@ jobs:
           python c/tools/make_glm53_multimodal_tiny.py --output /tmp/glm53_mm
           python c/tools/make_glm53_streaming_pair.py --fixture /tmp/glm53_mm --output /tmp/glm53_stream
           python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
+          python c/tests/test_glm53_streaming.py --binary ./c/glm53 --quantized /tmp/glm53_stream-i4 --dequantized /tmp/glm53_stream-deq
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
 

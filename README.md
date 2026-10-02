@@ -28,13 +28,16 @@ Version: `0.1.0.dev0`
 - Explicit 8, 16, and 32 GiB memory profiles
 - Native C hard-budget accounting by allocation category and runtime phase
 - GLM-5.3 Flash load-peak measurement and expert-cache admission control
+- Zero-cache GLM-5.3 expert execution through bounded reusable staging slots
+- Opt-in phase telemetry with `ARIVAN_MEMORY_TELEMETRY=1`
 - Cross-platform peak-memory measurement
 - Temporary compatibility with legacy `COLI_*` environment variables
 - Vision, pinned-cache, and MTP budgets represented in the profile contract
 - Python CLI regression tests and native C memory-budget tests
 
 Arivan currently refuses unsafe low-memory configurations instead of allowing
-the process to overcommit and fail later.
+the process to overcommit and fail later. The expert-cache floor has been
+removed; dense and vision weights remain the principal 8 GiB blockers.
 
 ## Quick start
 

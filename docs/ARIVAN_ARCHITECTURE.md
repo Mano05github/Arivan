@@ -39,11 +39,18 @@ The initial profiles are declared in both `arivan/memory.py` and
 the native profile table will become the source of truth once it is exposed to
 the control plane through a stable plan protocol.
 
+The native budget records accounted peaks separately for load, vision,
+prefill, and decode. Set `ARIVAN_MEMORY_TELEMETRY=1` to print transitions and
+the current, global-peak, phase-peak, limit, and available byte counts.
+
 The 8 GB profile reserves 2.75 GiB for the operating system and gives the
 engine a hard 5.25 GiB ceiling. It starts with one KV slot, 2,048 text tokens,
 128 visual tokens, a 384 MiB pin budget, a 512 MiB ordinary expert cache,
-prefill chunks of eight and MTP depth one. It remains experimental until the
-GLM-5.3 Flash adapter uses the native budget for every material allocation.
+prefill chunks of eight and MTP depth one. When a persistent expert slot for
+every sparse layer does not fit, the adapter falls back to one or two bounded
+whole-model staging slots. The profile remains experimental until dense and
+vision weights, forward workspaces, and every other material allocation use
+the native budget.
 
 ## Delivery order
 
