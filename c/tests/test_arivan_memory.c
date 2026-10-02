@@ -41,6 +41,24 @@ static void test_release_and_peak(void) {
     assert(budget.current_bytes == 300);
 }
 
+static void test_reclassify_preserves_total_and_is_transactional(void) {
+    ArivanMemoryBudget budget;
+    arivan_memory_budget_init(&budget, 2048);
+    assert(arivan_memory_reserve(&budget, ARIVAN_MEM_WORKSPACE, 700) == 0);
+    assert(arivan_memory_reclassify(
+               &budget, ARIVAN_MEM_WORKSPACE,
+               ARIVAN_MEM_RESIDENT_WEIGHTS, 600) == 0);
+    assert(budget.current_bytes == 700);
+    assert(budget.peak_bytes == 700);
+    assert(budget.by_kind[ARIVAN_MEM_WORKSPACE] == 100);
+    assert(budget.by_kind[ARIVAN_MEM_RESIDENT_WEIGHTS] == 600);
+    assert(arivan_memory_reclassify(
+               &budget, ARIVAN_MEM_WORKSPACE,
+               ARIVAN_MEM_RESIDENT_WEIGHTS, 101) == -1);
+    assert(budget.by_kind[ARIVAN_MEM_WORKSPACE] == 100);
+    assert(budget.by_kind[ARIVAN_MEM_RESIDENT_WEIGHTS] == 600);
+}
+
 static void test_phase_and_names(void) {
     ArivanMemoryBudget budget;
     arivan_memory_budget_init(&budget, 1000);
@@ -128,6 +146,7 @@ int main(void) {
     test_profiles();
     test_hard_limit_is_transactional();
     test_release_and_peak();
+    test_reclassify_preserves_total_and_is_transactional();
     test_phase_and_names();
     test_uniform_cache_clamps_and_reserves();
     test_uniform_cache_refusal_is_transactional();

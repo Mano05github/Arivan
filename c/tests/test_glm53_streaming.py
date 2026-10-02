@@ -30,10 +30,13 @@ import sys
 from pathlib import Path
 
 
-def run(binary, fixture, patches, grid, budget=None):
+def run(binary, fixture, patches, grid, budget=None, profile=None):
     environment = {**os.environ, "GLM53_BITS": "32"}
     if budget is not None:
         environment["GLM53_EXPERT_GB"] = budget
+    if profile is not None:
+        environment["ARIVAN_MEMORY_PROFILE"] = profile
+        environment["ARIVAN_MEMORY_TELEMETRY"] = "1"
     command = [binary, "--model", str(fixture), "--ids", patches["ids"]]
     if patches["file"]:
         command += ["--patches", patches["file"], "--grid", grid]
@@ -44,6 +47,7 @@ def run(binary, fixture, patches, grid, budget=None):
     for line in result.stdout.splitlines():
         if line.strip():
             parsed[line.split()[0]] = line.split()[1:]
+    parsed["_stderr"] = result.stderr
     return parsed
 
 
@@ -74,6 +78,8 @@ def main() -> int:
     wide = run(arguments.binary, arguments.quantized, patches, grid, budget="8")
     narrow = run(arguments.binary, arguments.quantized, patches, grid, budget="0.000001")
     staged = run(arguments.binary, arguments.quantized, patches, grid, budget="0")
+    profiled = run(arguments.binary, arguments.quantized, patches, grid,
+                   budget="0", profile="8gb")
 
     if "experts" not in wide or "experts" not in narrow or "experts" not in staged:
         print("FAIL: il motore non ha usato lo streaming sul contenitore int4")
@@ -96,13 +102,19 @@ def main() -> int:
         return 1
 
     for label, run_output in (("budget largo", wide), ("budget stretto", narrow),
-                              ("cache zero", staged)):
+                              ("cache zero", staged), ("profilo 8gb", profiled)):
         for field in ("teacher_forcing", "greedy"):
             if run_output[field] != resident[field]:
                 print(f"FAIL {field} con {label}\n"
                       f"  streaming: {run_output[field]}\n"
                       f"  residente: {resident[field]}")
                 return 1
+
+    telemetry = profiled["_stderr"]
+    for field in ("event=load-complete", "weights=", "vision=", "workspace="):
+        if field not in telemetry:
+            print(f"FAIL: telemetria del profilo 8gb senza {field}")
+            return 1
 
     print(f"PASS GLM-5.3 streaming: stessi token dei pesi residenti, "
           f"{misses['largo']} letture col budget largo e {misses['stretto']} "

@@ -10,6 +10,7 @@ extern "C" {
 
 typedef enum ArivanMemoryKind {
     ARIVAN_MEM_PERMANENT = 0,
+    ARIVAN_MEM_RESIDENT_WEIGHTS,
     ARIVAN_MEM_DENSE_WINDOW,
     ARIVAN_MEM_EXPERT_STAGING,
     ARIVAN_MEM_EXPERT_PINNED,
@@ -67,6 +68,10 @@ int arivan_memory_reserve(ArivanMemoryBudget *budget, ArivanMemoryKind kind,
                           uint64_t bytes);
 int arivan_memory_release(ArivanMemoryBudget *budget, ArivanMemoryKind kind,
                           uint64_t bytes);
+int arivan_memory_reclassify(ArivanMemoryBudget *budget,
+                             ArivanMemoryKind from,
+                             ArivanMemoryKind to,
+                             uint64_t bytes);
 uint64_t arivan_memory_available(const ArivanMemoryBudget *budget);
 int arivan_memory_reserve_uniform_cache(ArivanMemoryBudget *budget,
                                         ArivanMemoryKind kind,

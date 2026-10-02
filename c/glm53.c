@@ -643,6 +643,7 @@ typedef struct {
     const uint8_t *q4;
     const float *s;
     int rows, columns, gs;
+    uint64_t bytes;                       /* owned host bytes, excluding backend copies */
     void *vk;                             /* ColiVkTensor*, caricata alla prima uso */
     int resident;                         /* eligible for persistent accelerator wrapping */
     void *metal;                          /* ColiMetalTensor*, created lazily */
@@ -716,6 +717,7 @@ typedef struct {
     ArivanMemoryProfile memory_profile;
     ArivanMemoryBudget memory_budget;
     int memory_active;
+    ArivanMemoryKind load_kind;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -728,12 +730,73 @@ typedef struct {
     ColiVisionBlock *vblocks;
 } GModel;
 
+static void glm53_memory_reserve_or_die(GModel *m, ArivanMemoryKind kind,
+                                        uint64_t bytes, const char *label) {
+    if (!m->memory_active || bytes == 0) return;
+    const int status = arivan_memory_reserve(&m->memory_budget, kind, bytes);
+    if (status == 0) return;
+    if (status < 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] invalid allocation accounting for %s\n",
+                label);
+    } else {
+        fprintf(stderr,
+                "[ARIVAN MEMORY] %s profile refuses %s: %.2f MiB requested as %s, "
+                "%.2f MiB available below the %.2f GiB engine ceiling\n",
+                m->memory_profile.name, label, bytes / 1048576.0,
+                arivan_memory_kind_name(kind),
+                arivan_memory_available(&m->memory_budget) / 1048576.0,
+                m->memory_profile.engine_limit_bytes / 1073741824.0);
+    }
+    exit(1);
+}
+
+static void glm53_memory_release_bytes(GModel *m, ArivanMemoryKind kind,
+                                       uint64_t bytes) {
+    if (!m->memory_active || bytes == 0) return;
+    if (arivan_memory_release(&m->memory_budget, kind, bytes) != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] allocation ledger underflow for %s\n",
+                arivan_memory_kind_name(kind));
+        exit(1);
+    }
+}
+
+static void glm53_memory_reclassify_or_die(GModel *m, ArivanMemoryKind from,
+                                           ArivanMemoryKind to, uint64_t bytes,
+                                           const char *label) {
+    if (!m->memory_active || bytes == 0 || from == to) return;
+    if (arivan_memory_reclassify(&m->memory_budget, from, to, bytes) != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] cannot reclassify allocation for %s\n",
+                label);
+        exit(1);
+    }
+}
+
+static void glm53_memory_init(GModel *m) {
+    const char *profile_name = getenv("ARIVAN_MEMORY_PROFILE");
+    if (!profile_name || !*profile_name) return;
+    if (arivan_memory_profile(profile_name, &m->memory_profile) != 0) {
+        fprintf(stderr, "ARIVAN_MEMORY_PROFILE=%s is unknown\n", profile_name);
+        exit(2);
+    }
+    m->memory_active = 1;
+    m->load_kind = ARIVAN_MEM_RESIDENT_WEIGHTS;
+    arivan_memory_budget_init(&m->memory_budget,
+                              m->memory_profile.engine_limit_bytes);
+    /* Account for the process before model loading begins. Subsequent model
+     * allocations are recorded explicitly, so this baseline is not sampled
+     * again and cannot double-count loaded weights. */
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_PERMANENT,
+                                compat_peak_rss_bytes(), "process baseline");
+}
+
 static const float *load_f32(GModel *m, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
-    float *buffer = malloc((size_t)t->numel * sizeof(float));
+    const uint64_t bytes = (uint64_t)t->numel * sizeof(float);
+    glm53_memory_reserve_or_die(m, m->load_kind, bytes, name);
+    float *buffer = malloc((size_t)bytes);
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
     return buffer;
@@ -791,29 +854,47 @@ static void quantize_i4_grouped(const float *w, uint8_t *q4, float *scale,
 
 /* Un blocco f32 gia' in memoria, portato alla precisione chiesta. Possiede il
  * buffer: o lo tiene com'e' o lo libera dopo averlo quantizzato. */
-static Mat quantize_loaded(float *buffer, int rows, int columns) {
+static Mat quantize_loaded(GModel *m, float *buffer, int rows, int columns,
+                           const char *name) {
     Mat mat; memset(&mat, 0, sizeof(mat));
     mat.rows = rows; mat.columns = columns; mat.resident = 1;
+    const uint64_t source_bytes = (uint64_t)rows * columns * sizeof(float);
     const int bits = glm53_dense_bits();
-    if (bits == 32) { mat.fmt = 0; mat.f = buffer; return mat; }
+    if (bits == 32) {
+        glm53_memory_reclassify_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                       m->load_kind, source_bytes, name);
+        mat.fmt = 0; mat.f = buffer; mat.bytes = source_bytes;
+        return mat;
+    }
     if (bits == 4 && columns % 64 == 0) {
         const int groups = columns / 64;
-        uint8_t *packed = malloc((size_t)rows * ((columns + 1) / 2));
-        float *step = malloc((size_t)rows * groups * sizeof(float));
+        const uint64_t packed_bytes = (uint64_t)rows * ((columns + 1) / 2);
+        const uint64_t scale_bytes = (uint64_t)rows * groups * sizeof(float);
+        const uint64_t output_bytes = packed_bytes + scale_bytes;
+        glm53_memory_reserve_or_die(m, m->load_kind, output_bytes, name);
+        uint8_t *packed = malloc((size_t)packed_bytes);
+        float *step = malloc((size_t)scale_bytes);
         if (!packed || !step) { fprintf(stderr, "OOM quantizing %dx%d\n", rows, columns); exit(1); }
         quantize_i4_grouped(buffer, packed, step, rows, columns, 64);
         free(buffer);
+        glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, source_bytes);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
+        mat.bytes = output_bytes;
         return mat;
     }
     /* int8 per riga: e' anche il ripiego quando le colonne non sono multiple
      * di 64, che capita sulle proiezioni piccole dell'indexer. */
-    int8_t *level = malloc((size_t)rows * columns);
-    float *step = malloc((size_t)rows * sizeof(float));
+    const uint64_t level_bytes = (uint64_t)rows * columns;
+    const uint64_t scale_bytes = (uint64_t)rows * sizeof(float);
+    const uint64_t output_bytes = level_bytes + scale_bytes;
+    glm53_memory_reserve_or_die(m, m->load_kind, output_bytes, name);
+    int8_t *level = malloc((size_t)level_bytes);
+    float *step = malloc((size_t)scale_bytes);
     if (!level || !step) { fprintf(stderr, "OOM quantizing %dx%d\n", rows, columns); exit(1); }
     quantize_rows(buffer, level, step, rows, columns, 8);
     free(buffer);
-    mat.fmt = 1; mat.q8 = level; mat.s = step;
+    glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, source_bytes);
+    mat.fmt = 1; mat.q8 = level; mat.s = step; mat.bytes = output_bytes;
     return mat;
 }
 
@@ -847,9 +928,18 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
                 (long long)t->numel, (long long)H * (QK + V) * L, H);
         exit(1);
     }
-    float *whole = malloc((size_t)t->numel * sizeof(float));
-    float *kt = malloc((size_t)H * L * QK * sizeof(float));
-    float *vv = malloc((size_t)H * V * L * sizeof(float));
+    const uint64_t whole_bytes = (uint64_t)t->numel * sizeof(float);
+    const uint64_t kt_bytes = (uint64_t)H * L * QK * sizeof(float);
+    const uint64_t vv_bytes = (uint64_t)H * V * L * sizeof(float);
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                whole_bytes, name);
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                kt_bytes, "absorbed K projection");
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                vv_bytes, "absorbed V projection");
+    float *whole = malloc((size_t)whole_bytes);
+    float *kt = malloc((size_t)kt_bytes);
+    float *vv = malloc((size_t)vv_bytes);
     if (!whole || !kt || !vv) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, whole, t->numel, 1);
 
@@ -864,8 +954,9 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
                (size_t)V * L * sizeof(float));
     }
     free(whole);
-    l->kvb_kt = quantize_loaded(kt, H * L, QK);
-    l->kvb_v = quantize_loaded(vv, H * V, L);
+    glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, whole_bytes);
+    l->kvb_kt = quantize_loaded(m, kt, H * L, QK, "absorbed K projection");
+    l->kvb_v = quantize_loaded(m, vv, H * V, L, "absorbed V projection");
 }
 
 static Mat load_mat(GModel *m, const char *fmt, ...) {
@@ -914,23 +1005,30 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
             fprintf(stderr, "%s: %d columns are not multiples of 64\n", name, mat.columns);
             exit(1);
         }
-        uint8_t *packed = malloc((size_t)t->nbytes);
-        float *step = malloc((size_t)qs->numel * sizeof(float));
+        const uint64_t packed_bytes = (uint64_t)t->nbytes;
+        const uint64_t scale_bytes = (uint64_t)qs->numel * sizeof(float);
+        glm53_memory_reserve_or_die(m, m->load_kind,
+                                    packed_bytes + scale_bytes, name);
+        uint8_t *packed = malloc((size_t)packed_bytes);
+        float *step = malloc((size_t)scale_bytes);
         if (!packed || !step) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
         st_read_raw(&m->S, name, packed, 1);
         st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
+        mat.bytes = packed_bytes + scale_bytes;
         return mat;
     }
 
     if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
-    float *buffer = malloc((size_t)t->numel * sizeof(float));
+    const uint64_t source_bytes = (uint64_t)t->numel * sizeof(float);
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE, source_bytes, name);
+    float *buffer = malloc((size_t)source_bytes);
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
     mat.rows = (int)t->shape[0];
     mat.columns = (int)t->shape[1];
 
-    mat = quantize_loaded(buffer, mat.rows, mat.columns);
+    mat = quantize_loaded(m, buffer, mat.rows, mat.columns, name);
     return mat;
 }
 
@@ -1230,12 +1328,20 @@ static void glm53_memory_report(const GModel *m, const char *event) {
     const ArivanMemoryBudget *b = &m->memory_budget;
     fprintf(stderr,
             "[ARIVAN MEMORY] event=%s phase=%s current=%.2fMiB peak=%.2fMiB "
-            "phase_peak=%.2fMiB limit=%.2fMiB available=%.2fMiB\n",
+            "phase_peak=%.2fMiB limit=%.2fMiB available=%.2fMiB "
+            "baseline=%.2fMiB weights=%.2fMiB dense_window=%.2fMiB "
+            "vision=%.2fMiB workspace=%.2fMiB rss_peak=%.2fMiB\n",
             event, arivan_memory_phase_name(b->phase),
             b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
             b->peak_by_phase[b->phase] / 1048576.0,
             b->limit_bytes / 1048576.0,
-            arivan_memory_available(b) / 1048576.0);
+            arivan_memory_available(b) / 1048576.0,
+            b->by_kind[ARIVAN_MEM_PERMANENT] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_RESIDENT_WEIGHTS] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_DENSE_WINDOW] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_VISION] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_WORKSPACE] / 1048576.0,
+            compat_peak_rss_bytes() / 1048576.0);
 }
 
 static void glm53_memory_set_phase(GModel *m, ArivanMemoryPhase phase) {
@@ -1271,6 +1377,10 @@ static void expert_table_init(GModel *m) {
         "up_proj.weight",   "up_proj.weight.qs",
         "down_proj.weight", "down_proj.weight.qs",
     };
+    const uint64_t table_bytes =
+        (uint64_t)c->n_layers * c->n_experts * sizeof(*m->eref);
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_PERMANENT,
+                                table_bytes, "expert index");
     m->eref = calloc((size_t)c->n_layers * c->n_experts, sizeof(*m->eref));
     if (!m->eref) { fprintf(stderr, "OOM allocating expert table\n"); exit(1); }
 
@@ -1352,33 +1462,11 @@ static void expert_cache_init(GModel *m) {
     if (!force_staging && cap < 1) cap = 1;
     if (cap > c->n_experts) cap = c->n_experts;
 
-    /* Arivan's profile is a hard whole-process ceiling, unlike the inherited
-     * GLM53_EXPERT_GB hint which prices only routed experts. Account for the
-     * peak working set already consumed by resident text/vision weights, then
-     * clamp the cache to what actually remains. The 8 GB milestone currently
-     * refuses here when the dense trunk is still too large; that is safer than
-     * calling a profile successful and dying later in the first expert miss. */
-    const char *profile_name = getenv("ARIVAN_MEMORY_PROFILE");
-    if (profile_name && *profile_name) {
-        uint64_t resident = 0;
+    /* Arivan's profile is active before the first model allocation. Unlike
+     * GLM53_EXPERT_GB, it prices the whole engine and therefore gives this
+     * cache only the bytes left after resident text and vision weights. */
+    if (m->memory_active) {
         ArivanExpertPlan plan;
-        if (arivan_memory_profile(profile_name, &m->memory_profile) != 0) {
-            fprintf(stderr, "ARIVAN_MEMORY_PROFILE=%s is unknown\n", profile_name);
-            exit(2);
-        }
-        m->memory_active = 1;
-        resident = compat_peak_rss_bytes();
-        arivan_memory_budget_init(&m->memory_budget,
-                                  m->memory_profile.engine_limit_bytes);
-        if (arivan_memory_reserve(&m->memory_budget,
-                                  ARIVAN_MEM_PERMANENT, resident) != 0) {
-            fprintf(stderr,
-                    "[ARIVAN MEMORY] %s profile: resident load peak %.2f GiB already "
-                    "exceeds the %.2f GiB engine ceiling; dense/vision paging is required\n",
-                    m->memory_profile.name, resident / 1073741824.0,
-                    m->memory_profile.engine_limit_bytes / 1073741824.0);
-            exit(1);
-        }
         int plan_status = arivan_memory_plan_experts(
             &m->memory_budget, slot_budget_bytes, (uint32_t)sparse,
             m->memory_profile.expert_cache_bytes, (uint32_t)cap, 2, &plan);
@@ -1398,16 +1486,18 @@ static void expert_cache_init(GModel *m) {
         m->estage_cap = (int)plan.staging_slots;
         if (cap > 0)
             fprintf(stderr,
-                    "[ARIVAN MEMORY] %s: load peak %.2f GiB, expert cache %d/layer "
+                    "[ARIVAN MEMORY] %s: accounted %.2f GiB, expert cache %d/layer "
                     "(%.0f MiB), ceiling %.2f GiB\n",
-                    m->memory_profile.name, resident / 1073741824.0, cap,
+                    m->memory_profile.name,
+                    m->memory_budget.current_bytes / 1073741824.0, cap,
                     plan.cache_bytes / 1048576.0,
                     m->memory_profile.engine_limit_bytes / 1073741824.0);
         else
             fprintf(stderr,
-                    "[ARIVAN MEMORY] %s: load peak %.2f GiB, zero-cache staging %d "
+                    "[ARIVAN MEMORY] %s: accounted %.2f GiB, zero-cache staging %d "
                     "slot(s) (%.0f MiB), ceiling %.2f GiB\n",
-                    m->memory_profile.name, resident / 1073741824.0,
+                    m->memory_profile.name,
+                    m->memory_budget.current_bytes / 1073741824.0,
                     m->estage_cap, plan.staging_bytes / 1048576.0,
                     m->memory_profile.engine_limit_bytes / 1073741824.0);
         glm53_memory_report(m, "load");
@@ -1858,11 +1948,11 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL },
+          inter, hidden, 64, 0, NULL, 0, NULL },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL },
+          inter, hidden, 64, 0, NULL, 0, NULL },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL },
+          hidden, inter, 64, 0, NULL, 0, NULL },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -2150,6 +2240,7 @@ static void expert_cache_init(GModel *m);
 
 static void model_load_range(GModel *m, const char *dir, int layer_begin,
                              int layer_end, int load_io) {
+    glm53_memory_init(m);
     load_cfg(&m->c, dir);
     st_init(&m->S, dir);
     glm53_mirror_setup(m, dir);
@@ -2188,7 +2279,11 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             m->head.columns = m->c.hidden;
         }
     }
+    glm53_memory_reserve_or_die(
+        m, ARIVAN_MEM_PERMANENT,
+        (uint64_t)m->c.n_layers * sizeof(*m->layer), "layer metadata");
     m->layer = calloc((size_t)m->c.n_layers, sizeof(*m->layer));
+    if (!m->layer) { fprintf(stderr, "OOM allocating layer metadata\n"); exit(1); }
 
     /* Streaming o residenti: lo decide il contenitore, non una variabile
      * d'ambiente. Si guarda il primo esperto del primo layer sparso. */
@@ -2328,6 +2423,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
      * l'avevano ancora preso. */
     if (m->streaming) expert_cache_init(m);
+    glm53_memory_report(m, "load-complete");
 }
 
 /* ---------- vision ----------
@@ -2340,6 +2436,8 @@ static void vision_load(GModel *m) {
     if (c->vis_layers <= 0) return;
     if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) return;
     const char *V = "model.visual.";
+    const ArivanMemoryKind previous_kind = m->load_kind;
+    m->load_kind = ARIVAN_MEM_VISION;
 
     m->vision.config = (ColiVisionConfig){
         .depth = c->vis_layers, .hidden = c->vis_hidden, .heads = c->vis_heads,
@@ -2383,6 +2481,7 @@ static void vision_load(GModel *m) {
     }
     m->vision.blocks = m->vblocks;
     m->has_vision = 1;
+    m->load_kind = previous_kind;
 }
 
 /* Un'immagine gia' in patch -> embedding pronti per il flusso testuale.

@@ -27,6 +27,8 @@ Version: `0.1.0.dev0`
 - Independent `arivan` command and Python package
 - Explicit 8, 16, and 32 GiB memory profiles
 - Native C hard-budget accounting by allocation category and runtime phase
+- Pre-allocation admission checks for resident text and vision tensors
+- Load-time quantization peak accounting, including temporary f32 buffers
 - GLM-5.3 Flash load-peak measurement and expert-cache admission control
 - Zero-cache GLM-5.3 expert execution through bounded reusable staging slots
 - Opt-in phase telemetry with `ARIVAN_MEMORY_TELEMETRY=1`

@@ -41,16 +41,22 @@ the control plane through a stable plan protocol.
 
 The native budget records accounted peaks separately for load, vision,
 prefill, and decode. Set `ARIVAN_MEMORY_TELEMETRY=1` to print transitions and
-the current, global-peak, phase-peak, limit, and available byte counts.
+the current, global-peak, phase-peak, limit, available byte counts, observed
+RSS peak, and the baseline, resident-weight, dense-window, vision, and
+workspace categories. Profile enforcement starts before the first model
+allocation. Load-time quantization accounts its temporary f32 source together
+with the final resident representation, then transactionally reclassifies or
+releases the temporary bytes.
 
 The 8 GB profile reserves 2.75 GiB for the operating system and gives the
 engine a hard 5.25 GiB ceiling. It starts with one KV slot, 2,048 text tokens,
 128 visual tokens, a 384 MiB pin budget, a 512 MiB ordinary expert cache,
 prefill chunks of eight and MTP depth one. When a persistent expert slot for
 every sparse layer does not fit, the adapter falls back to one or two bounded
-whole-model staging slots. The profile remains experimental until dense and
-vision weights, forward workspaces, and every other material allocation use
-the native budget.
+whole-model staging slots. Resident text and vision tensors now use the native
+allocation ledger. The profile remains experimental until dense weights use
+bounded layer windows, vision weights become phase-scoped, and all forward
+workspaces use the native budget.
 
 ## Delivery order
 

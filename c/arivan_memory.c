@@ -66,6 +66,21 @@ int arivan_memory_release(ArivanMemoryBudget *budget, ArivanMemoryKind kind,
     return 0;
 }
 
+int arivan_memory_reclassify(ArivanMemoryBudget *budget,
+                             ArivanMemoryKind from,
+                             ArivanMemoryKind to,
+                             uint64_t bytes) {
+    if (!budget || from < 0 || from >= ARIVAN_MEM_KIND_COUNT ||
+        to < 0 || to >= ARIVAN_MEM_KIND_COUNT ||
+        bytes > budget->by_kind[from])
+        return -1;
+    if (from == to || bytes == 0) return 0;
+    if (UINT64_MAX - budget->by_kind[to] < bytes) return -1;
+    budget->by_kind[from] -= bytes;
+    budget->by_kind[to] += bytes;
+    return 0;
+}
+
 uint64_t arivan_memory_available(const ArivanMemoryBudget *budget) {
     if (!budget || budget->current_bytes >= budget->limit_bytes) return 0;
     return budget->limit_bytes - budget->current_bytes;
@@ -150,8 +165,9 @@ int arivan_memory_plan_experts(ArivanMemoryBudget *budget,
 
 const char *arivan_memory_kind_name(ArivanMemoryKind kind) {
     static const char *const names[ARIVAN_MEM_KIND_COUNT] = {
-        "permanent", "dense-window", "expert-staging", "expert-pinned",
-        "expert-lru", "kv-state", "vision", "mtp", "workspace", "server"
+        "permanent", "resident-weights", "dense-window", "expert-staging",
+        "expert-pinned", "expert-lru", "kv-state", "vision", "mtp",
+        "workspace", "server"
     };
     if (kind < 0 || kind >= ARIVAN_MEM_KIND_COUNT) return "invalid";
     return names[kind];
