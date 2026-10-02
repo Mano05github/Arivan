@@ -1534,6 +1534,9 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             "head_window=%.2fMiB dense_window=%.2fMiB vision=%.2fMiB "
             "workspace=%.2fMiB embedding_window_peak=%.2fMiB "
             "head_window_peak=%.2fMiB dense_window_peak=%.2fMiB "
+            "embedding_window_bytes=%llu head_window_bytes=%llu "
+            "dense_window_bytes=%llu embedding_window_peak_bytes=%llu "
+            "head_window_peak_bytes=%llu dense_window_peak_bytes=%llu "
             "dense_window_layer=%d rss_peak=%.2fMiB\n",
             event, arivan_memory_phase_name(b->phase),
             b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
@@ -1550,6 +1553,12 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             m->embedding_window_peak / 1048576.0,
             m->output_head_window_peak / 1048576.0,
             m->dense_window_peak / 1048576.0,
+            (unsigned long long)b->by_kind[ARIVAN_MEM_EMBEDDING_WINDOW],
+            (unsigned long long)b->by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW],
+            (unsigned long long)b->by_kind[ARIVAN_MEM_DENSE_WINDOW],
+            (unsigned long long)m->embedding_window_peak,
+            (unsigned long long)m->output_head_window_peak,
+            (unsigned long long)m->dense_window_peak,
             m->dense_window_peak_layer,
             compat_peak_rss_bytes() / 1048576.0);
 }
