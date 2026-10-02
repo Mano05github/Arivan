@@ -25,6 +25,7 @@ controllo di questo test.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -111,10 +112,20 @@ def main() -> int:
                 return 1
 
     telemetry = profiled["_stderr"]
-    for field in ("event=load-complete", "weights=", "vision=", "workspace="):
+    for field in ("event=load-complete", "weights=", "vision=", "workspace=",
+                  "dense_window_peak="):
         if field not in telemetry:
             print(f"FAIL: telemetria del profilo 8gb senza {field}")
             return 1
+    peaks = [float(value) for value in
+             re.findall(r"dense_window_peak=([0-9.]+)MiB", telemetry)]
+    if not peaks or max(peaks) <= 0.0:
+        print("FAIL: il profilo 8gb non ha materializzato una finestra densa")
+        return 1
+    closed = [line for line in telemetry.splitlines() if "event=session-close" in line]
+    if not closed or "dense_window=0.00MiB" not in closed[-1]:
+        print("FAIL: la finestra densa non e' stata rilasciata a fine inferenza")
+        return 1
 
     print(f"PASS GLM-5.3 streaming: stessi token dei pesi residenti, "
           f"{misses['largo']} letture col budget largo e {misses['stretto']} "

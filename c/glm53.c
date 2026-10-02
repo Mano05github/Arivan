@@ -644,6 +644,9 @@ typedef struct {
     const float *s;
     int rows, columns, gs;
     uint64_t bytes;                       /* owned host bytes, excluding backend copies */
+    st_tensor *source, *scale_source;     /* stable entries in the shard index */
+    ArivanMemoryKind budget_kind;
+    int deferred;
     void *vk;                             /* ColiVkTensor*, caricata alla prima uso */
     int resident;                         /* eligible for persistent accelerator wrapping */
     void *metal;                          /* ColiMetalTensor*, created lazily */
@@ -718,6 +721,11 @@ typedef struct {
     ArivanMemoryBudget memory_budget;
     int memory_active;
     ArivanMemoryKind load_kind;
+    int dense_paging;
+    int defer_mat_loads;
+    int active_dense_layer;
+    uint64_t dense_window_peak;
+    int dense_window_peak_layer;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -780,6 +788,9 @@ static void glm53_memory_init(GModel *m) {
     }
     m->memory_active = 1;
     m->load_kind = ARIVAN_MEM_RESIDENT_WEIGHTS;
+    m->dense_paging = 1;
+    m->active_dense_layer = -1;
+    m->dense_window_peak_layer = -1;
     arivan_memory_budget_init(&m->memory_budget,
                               m->memory_profile.engine_limit_bytes);
     /* Account for the process before model loading begins. Subsequent model
@@ -855,14 +866,15 @@ static void quantize_i4_grouped(const float *w, uint8_t *q4, float *scale,
 /* Un blocco f32 gia' in memoria, portato alla precisione chiesta. Possiede il
  * buffer: o lo tiene com'e' o lo libera dopo averlo quantizzato. */
 static Mat quantize_loaded(GModel *m, float *buffer, int rows, int columns,
-                           const char *name) {
+                           ArivanMemoryKind kind, const char *name) {
     Mat mat; memset(&mat, 0, sizeof(mat));
     mat.rows = rows; mat.columns = columns; mat.resident = 1;
+    mat.budget_kind = kind;
     const uint64_t source_bytes = (uint64_t)rows * columns * sizeof(float);
     const int bits = glm53_dense_bits();
     if (bits == 32) {
         glm53_memory_reclassify_or_die(m, ARIVAN_MEM_WORKSPACE,
-                                       m->load_kind, source_bytes, name);
+                                       kind, source_bytes, name);
         mat.fmt = 0; mat.f = buffer; mat.bytes = source_bytes;
         return mat;
     }
@@ -871,7 +883,7 @@ static Mat quantize_loaded(GModel *m, float *buffer, int rows, int columns,
         const uint64_t packed_bytes = (uint64_t)rows * ((columns + 1) / 2);
         const uint64_t scale_bytes = (uint64_t)rows * groups * sizeof(float);
         const uint64_t output_bytes = packed_bytes + scale_bytes;
-        glm53_memory_reserve_or_die(m, m->load_kind, output_bytes, name);
+        glm53_memory_reserve_or_die(m, kind, output_bytes, name);
         uint8_t *packed = malloc((size_t)packed_bytes);
         float *step = malloc((size_t)scale_bytes);
         if (!packed || !step) { fprintf(stderr, "OOM quantizing %dx%d\n", rows, columns); exit(1); }
@@ -887,7 +899,7 @@ static Mat quantize_loaded(GModel *m, float *buffer, int rows, int columns,
     const uint64_t level_bytes = (uint64_t)rows * columns;
     const uint64_t scale_bytes = (uint64_t)rows * sizeof(float);
     const uint64_t output_bytes = level_bytes + scale_bytes;
-    glm53_memory_reserve_or_die(m, m->load_kind, output_bytes, name);
+    glm53_memory_reserve_or_die(m, kind, output_bytes, name);
     int8_t *level = malloc((size_t)level_bytes);
     float *step = malloc((size_t)scale_bytes);
     if (!level || !step) { fprintf(stderr, "OOM quantizing %dx%d\n", rows, columns); exit(1); }
@@ -955,8 +967,46 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
     }
     free(whole);
     glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, whole_bytes);
-    l->kvb_kt = quantize_loaded(m, kt, H * L, QK, "absorbed K projection");
-    l->kvb_v = quantize_loaded(m, vv, H * V, L, "absorbed V projection");
+    l->kvb_kt = quantize_loaded(m, kt, H * L, QK, m->load_kind,
+                                "absorbed K projection");
+    l->kvb_v = quantize_loaded(m, vv, H * V, L, m->load_kind,
+                               "absorbed V projection");
+}
+
+static void mat_materialize(GModel *m, Mat *mat) {
+    if (!mat || mat->f || mat->q8 || mat->q4 || !mat->source) return;
+    st_tensor *t = mat->source;
+    const char *name = t->name;
+    const ArivanMemoryKind kind = mat->budget_kind;
+    const int deferred = mat->deferred;
+
+    if (t->dtype == 3) {
+        st_tensor *qs = mat->scale_source;
+        const uint64_t packed_bytes = (uint64_t)t->nbytes;
+        const uint64_t scale_bytes = (uint64_t)qs->numel * sizeof(float);
+        glm53_memory_reserve_or_die(m, kind, packed_bytes + scale_bytes, name);
+        uint8_t *packed = malloc((size_t)packed_bytes);
+        float *step = malloc((size_t)scale_bytes);
+        if (!packed || !step) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+        st_read_raw(&m->S, name, packed, 1);
+        st_read_f32_cap(&m->S, qs->name, step, qs->numel, 1);
+        mat->fmt = 4; mat->q4 = packed; mat->s = step; mat->gs = 64;
+        mat->resident = !deferred; mat->bytes = packed_bytes + scale_bytes;
+        return;
+    }
+
+    const uint64_t source_bytes = (uint64_t)t->numel * sizeof(float);
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE, source_bytes, name);
+    float *buffer = malloc((size_t)source_bytes);
+    if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+    st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
+    Mat loaded = quantize_loaded(m, buffer, mat->rows, mat->columns, kind, name);
+    loaded.source = mat->source;
+    loaded.scale_source = mat->scale_source;
+    loaded.budget_kind = kind;
+    loaded.deferred = deferred;
+    loaded.resident = !deferred;
+    *mat = loaded;
 }
 
 static Mat load_mat(GModel *m, const char *fmt, ...) {
@@ -965,71 +1015,126 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing matrix %s\n", name); exit(1); }
     Mat mat; memset(&mat, 0, sizeof(mat));
+    mat.source = t;
+    mat.deferred = m->defer_mat_loads;
+    mat.budget_kind = mat.deferred ? ARIVAN_MEM_DENSE_WINDOW : m->load_kind;
 
     /* Gia' quantizzato nel checkpoint: si prende com'e', senza passare per
-     * f32. Un giro in f32 costerebbe il picco di RAM che stiamo evitando, e
-     * riquantizzare quello che e' gia' quantizzato perde bit per niente. */
-    if (t->dtype == 3) {                  /* U8/I8 in st.h: il container int4 */
+     * f32. Un giro in f32 costerebbe il picco di RAM che stiamo evitando. */
+    if (t->dtype == 3) {
         char scales[544];
         snprintf(scales, sizeof(scales), "%s.qs", name);
         st_tensor *qs = st_find(&m->S, scales);
-        if (!qs) {
-            fprintf(stderr, "%s e' int4 ma missing %s\n", name, scales);
-            exit(1);
-        }
-        /* Il contenitore e' piatto: 4.194.304 byte di nibble e 131.072 scale,
-         * senza righe ne' colonne scritte da nessuna parte. Va benissimo per
-         * gli esperti, che passano dallo streaming e prendono la forma dalla
-         * config (moe_inter x hidden, e il down al contrario). Qui invece la
-         * forma servirebbe e non c'e': tirarla a indovinare da un solo numero
-         * vorrebbe dire calcolare su una matrice trasposta senza accorgersene.
-         *
-         * Con il converter di oggi questo caso non si presenta, perche' tutto
-         * cio' che non e' esperto resta BF16 e la precisione la sceglie
-         * GLM53_BITS a load time. Se un domani si quantizzasse anche il resto,
-         * la strada e' quella di kimi_k3: la forma la passa il chiamante. */
+        if (!qs) { fprintf(stderr, "%s e' int4 ma missing %s\n", name, scales); exit(1); }
         const int64_t values = qs->numel * 64;
-        if (t->nbytes * 2 != values) {
-            fprintf(stderr, "%s: %lld bytes and %lld scales do not form int4 gs64\n",
-                    name, (long long)t->nbytes, (long long)qs->numel);
-            exit(1);
-        }
-        if (t->rank != 2) {
-            fprintf(stderr, "%s: flat int4 container outside routed experts; "
-                            "the shape is not stored in the file and cannot be inferred\n", name);
+        if (t->nbytes * 2 != values || t->rank != 2) {
+            fprintf(stderr, "%s: invalid int4 gs64 matrix metadata\n", name);
             exit(1);
         }
         mat.rows = (int)t->shape[0];
         mat.columns = (int)(values / t->shape[0]);
+        mat.scale_source = qs;
         if (mat.columns % 64) {
             fprintf(stderr, "%s: %d columns are not multiples of 64\n", name, mat.columns);
             exit(1);
         }
-        const uint64_t packed_bytes = (uint64_t)t->nbytes;
-        const uint64_t scale_bytes = (uint64_t)qs->numel * sizeof(float);
-        glm53_memory_reserve_or_die(m, m->load_kind,
-                                    packed_bytes + scale_bytes, name);
-        uint8_t *packed = malloc((size_t)packed_bytes);
-        float *step = malloc((size_t)scale_bytes);
-        if (!packed || !step) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
-        st_read_raw(&m->S, name, packed, 1);
-        st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
-        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
-        mat.bytes = packed_bytes + scale_bytes;
-        return mat;
+    } else {
+        if (t->rank != 2) {
+            fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank);
+            exit(1);
+        }
+        mat.rows = (int)t->shape[0];
+        mat.columns = (int)t->shape[1];
     }
-
-    if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
-    const uint64_t source_bytes = (uint64_t)t->numel * sizeof(float);
-    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE, source_bytes, name);
-    float *buffer = malloc((size_t)source_bytes);
-    if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
-    st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
-    mat.rows = (int)t->shape[0];
-    mat.columns = (int)t->shape[1];
-
-    mat = quantize_loaded(m, buffer, mat.rows, mat.columns, name);
+    if (!mat.deferred) mat_materialize(m, &mat);
     return mat;
+}
+
+static void mat_drop_data(GModel *m, Mat *mat, int keep_descriptor) {
+    if (!mat) return;
+    st_tensor *source = mat->source;
+    st_tensor *scale_source = mat->scale_source;
+    const int rows = mat->rows, columns = mat->columns;
+    const ArivanMemoryKind kind = mat->budget_kind;
+    const int deferred = mat->deferred;
+#ifdef COLI_METAL
+    if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
+#endif
+#ifdef COLI_VULKAN
+    if (mat->vk) coli_vk_tensor_free((ColiVkTensor *)mat->vk);
+#endif
+    free((void *)mat->f); free((void *)mat->q8);
+    free((void *)mat->q4); free((void *)mat->s);
+    glm53_memory_release_bytes(m, kind, mat->bytes);
+    memset(mat, 0, sizeof(*mat));
+    if (keep_descriptor) {
+        mat->source = source;
+        mat->scale_source = scale_source;
+        mat->rows = rows;
+        mat->columns = columns;
+        mat->budget_kind = kind;
+        mat->deferred = deferred;
+    }
+}
+
+static int layer_matrix_list(GLayer *l, Mat **mats) {
+    Mat *all[] = { &l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb,
+                   &l->kfa, &l->kfb, &l->kb, &l->qa, &l->qb, &l->kva,
+                   &l->kvb_kt, &l->kvb_v, &l->o, &l->iwq, &l->iwk,
+                   &l->iwp, &l->ikpg, &l->dg, &l->du, &l->dd,
+                   &l->rg, &l->ru, &l->rd };
+    const int count = (int)(sizeof(all) / sizeof(*all));
+    for (int i = 0; i < count; i++) mats[i] = all[i];
+    return count;
+}
+
+static void layer_window_load(GModel *m, int index) {
+    if (!m->dense_paging) return;
+    if (m->active_dense_layer != -1) {
+        fprintf(stderr, "dense window invariant: layer %d still resident\n",
+                m->active_dense_layer);
+        exit(1);
+    }
+    GLayer *l = &m->layer[index];
+    Mat *mats[25];
+    const int count = layer_matrix_list(l, mats);
+    for (int i = 0; i < count; i++) mat_materialize(m, mats[i]);
+    if (m->c.is_full[index]) {
+        char name[512];
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.kv_b_proj.weight",
+                 m->prefix, index);
+        const ArivanMemoryKind previous_kind = m->load_kind;
+        m->load_kind = ARIVAN_MEM_DENSE_WINDOW;
+        absorb_kvb(m, l, name);
+        m->load_kind = previous_kind;
+    }
+    m->active_dense_layer = index;
+    const uint64_t window =
+        m->memory_budget.by_kind[ARIVAN_MEM_DENSE_WINDOW];
+    if (window > m->dense_window_peak) {
+        m->dense_window_peak = window;
+        m->dense_window_peak_layer = index;
+    }
+}
+
+static void layer_window_release(GModel *m, int index) {
+    if (!m->dense_paging) return;
+    if (m->active_dense_layer != index) {
+        fprintf(stderr, "dense window invariant: releasing layer %d while %d is active\n",
+                index, m->active_dense_layer);
+        exit(1);
+    }
+    Mat *mats[25];
+    const int count = layer_matrix_list(&m->layer[index], mats);
+    for (int i = 0; i < count; i++)
+        mat_drop_data(m, mats[i], mats[i]->deferred);
+    m->active_dense_layer = -1;
+    if (m->memory_budget.by_kind[ARIVAN_MEM_DENSE_WINDOW] != 0 ||
+        m->memory_budget.by_kind[ARIVAN_MEM_WORKSPACE] != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] layer %d left window/workspace bytes reserved\n",
+                index);
+        exit(1);
+    }
 }
 
 /* Come mv ma su un blocco di righe contigue: serve alle matrici che tengono
@@ -1330,7 +1435,8 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             "[ARIVAN MEMORY] event=%s phase=%s current=%.2fMiB peak=%.2fMiB "
             "phase_peak=%.2fMiB limit=%.2fMiB available=%.2fMiB "
             "baseline=%.2fMiB weights=%.2fMiB dense_window=%.2fMiB "
-            "vision=%.2fMiB workspace=%.2fMiB rss_peak=%.2fMiB\n",
+            "vision=%.2fMiB workspace=%.2fMiB dense_window_peak=%.2fMiB "
+            "dense_window_layer=%d rss_peak=%.2fMiB\n",
             event, arivan_memory_phase_name(b->phase),
             b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
             b->peak_by_phase[b->phase] / 1048576.0,
@@ -1341,6 +1447,8 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             b->by_kind[ARIVAN_MEM_DENSE_WINDOW] / 1048576.0,
             b->by_kind[ARIVAN_MEM_VISION] / 1048576.0,
             b->by_kind[ARIVAN_MEM_WORKSPACE] / 1048576.0,
+            m->dense_window_peak / 1048576.0,
+            m->dense_window_peak_layer,
             compat_peak_rss_bytes() / 1048576.0);
 }
 
@@ -1947,12 +2055,12 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
 static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
-        { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, 0, NULL, 0, NULL },
-        { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, 0, NULL, 0, NULL },
-        { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, 0, NULL, 0, NULL },
+        { .fmt = 4, .q4 = slot->piece[0], .s = (const float *)slot->piece[1],
+          .rows = inter, .columns = hidden, .gs = 64 },
+        { .fmt = 4, .q4 = slot->piece[2], .s = (const float *)slot->piece[3],
+          .rows = inter, .columns = hidden, .gs = 64 },
+        { .fmt = 4, .q4 = slot->piece[4], .s = (const float *)slot->piece[5],
+          .rows = hidden, .columns = inter, .gs = 64 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -2301,6 +2409,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         expert_table_init(m);
     }
 
+    m->defer_mat_loads = m->dense_paging;
     for (int i = layer_begin; i < layer_end; i++) {
         GLayer *l = &m->layer[i];
         l->in_ln = load_f32(m, "%slayers.%d.input_layernorm.weight", P, i);
@@ -2321,7 +2430,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                 char kvb_name[512];
                 snprintf(kvb_name, sizeof(kvb_name),
                          "%slayers.%d.self_attn.kv_b_proj.weight", P, i);
-                absorb_kvb(m, l, kvb_name);
+                if (!m->dense_paging) absorb_kvb(m, l, kvb_name);
             }
             l->o = load_mat(m, "%slayers.%d.self_attn.o_proj.weight", P, i);
             l->iwq = load_mat(m, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
@@ -2380,14 +2489,18 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                 l->eg = malloc((size_t)m->c.n_experts * sizeof(Mat));
                 l->eu = malloc((size_t)m->c.n_experts * sizeof(Mat));
                 l->ed = malloc((size_t)m->c.n_experts * sizeof(Mat));
+                const int defer = m->defer_mat_loads;
+                m->defer_mat_loads = 0;
                 for (int e = 0; e < m->c.n_experts; e++) {
                     l->eg[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.gate_proj.weight", P, i, e);
                     l->eu[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.up_proj.weight", P, i, e);
                     l->ed[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.down_proj.weight", P, i, e);
                 }
+                m->defer_mat_loads = defer;
             }
         }
     }
+    m->defer_mat_loads = 0;
     vision_load(m);
 #ifdef COLI_METAL
     /* Metal is runtime opt-in. Failure is non-fatal: the existing CPU path
@@ -2632,6 +2745,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     }
 
     for (int i = begin; i < end; i++) {
+        layer_window_load(m, i);
         GLayer *l = &m->layer[i];
         for (int site = 0; site < 2; site++) {
             const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
@@ -2665,6 +2779,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                              comb + (size_t)t * H * H, H, D);
             float *swap = streams; streams = next; next = swap;
         }
+        layer_window_release(m, i);
     }
     free(comb); free(post); free(branch); free(normed); free(collapsed);
     return streams;
@@ -2679,6 +2794,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
 static void mat_release(Mat *mat) {
 #ifdef COLI_METAL
     if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
+#endif
+#ifdef COLI_VULKAN
+    if (mat->vk) coli_vk_tensor_free((ColiVkTensor *)mat->vk);
 #endif
     free((void *)mat->f); free((void *)mat->q8);
     free((void *)mat->q4); free((void *)mat->s);

@@ -54,9 +54,11 @@ engine a hard 5.25 GiB ceiling. It starts with one KV slot, 2,048 text tokens,
 prefill chunks of eight and MTP depth one. When a persistent expert slot for
 every sparse layer does not fit, the adapter falls back to one or two bounded
 whole-model staging slots. Resident text and vision tensors now use the native
-allocation ledger. The profile remains experimental until dense weights use
-bounded layer windows, vision weights become phase-scoped, and all forward
-workspaces use the native budget.
+allocation ledger. Under a native profile, transformer matrices are described
+at startup and materialized synchronously into a single-layer `dense-window`
+allocation, which is released before advancing to the next layer. The profile
+remains experimental until global embedding/head residency is bounded, vision
+weights become phase-scoped, and all forward workspaces use the native budget.
 
 ## Delivery order
 

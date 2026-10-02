@@ -41,6 +41,14 @@ class ArivanGlm53SourceTest(unittest.TestCase):
         self.assertIn("uint64_t bytes;", SOURCE)
         self.assertIn("mat.bytes = output_bytes", SOURCE)
 
+    def test_profile_uses_one_layer_dense_window(self):
+        self.assertIn("m->dense_paging = 1", SOURCE)
+        self.assertIn("layer_window_load(m, i)", SOURCE)
+        self.assertIn("layer_window_release(m, i)", SOURCE)
+        self.assertIn("mat->budget_kind = kind", SOURCE)
+        self.assertIn("ARIVAN_MEM_DENSE_WINDOW", SOURCE)
+        self.assertIn("dense window invariant", SOURCE)
+
     def test_every_glm53_link_path_includes_native_memory_module(self):
         self.assertIn("glm53: glm53$(EXE)", MAKEFILE)
         self.assertIn("$(SEGMENT_BUILD_DIR)/arivan_memory.o", MAKEFILE)
