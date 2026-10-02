@@ -39,15 +39,11 @@ bench = [
 ]
 
 [project.scripts]
-coli = "colibri.cli:main"
 arivan = "arivan.cli:main"
-
-[project.urls]
-Upstream = "https://github.com/JustVugg/colibri"
 
 [tool.setuptools.dynamic]
 version = {attr = "arivan._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["arivan*", "colibri*"]
+include = ["arivan*"]

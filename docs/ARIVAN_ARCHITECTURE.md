@@ -1,7 +1,7 @@
 # Arivan architecture
 
-Arivan is a CPU-first coding-agent runtime derived from Colibri. Its defining
-constraint is a hard, observable memory budget: the engine must account for
+Arivan is a CPU-first coding-agent runtime. Its defining constraint is a hard,
+observable memory budget: the engine must account for
 resident weights, file-backed working pages, expert caches, state and temporary
 workspaces instead of treating `--ram` as an expert-cache hint.
 

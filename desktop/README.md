@@ -1,4 +1,4 @@
-# colibrì desktop
+# Arivan desktop
 
 Tauri v2 shell for the shared React interface in `../web`.
 

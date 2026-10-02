@@ -1,8 +1,8 @@
 """Console entry point for Arivan.
 
-The native runtime is inherited from Colibri while Arivan's shared pager and
-agent layer are developed. This adapter keeps legacy COLI_* variables working
-and gives new installations stable ARIVAN_* names.
+The native runtime remains compatible with legacy COLI_* variables while the
+shared pager and agent layer are developed. New installations use stable
+ARIVAN_* names.
 """
 
 from __future__ import annotations

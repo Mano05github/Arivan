@@ -11,10 +11,9 @@ arivan > Explain this repository
 ```
 
 Arivan is an experimental, CPU-first coding-agent runtime designed to run
-large open-weight models under explicit memory budgets. It is derived from
-[Colibri](https://github.com/JustVugg/colibri) and retains Colibri's native C
-inference engines while introducing bounded memory profiles, a stable Arivan
-CLI, and a path toward low-memory model execution.
+large open-weight models under explicit memory budgets. It combines native C
+inference engines with bounded memory profiles, a stable command-line
+interface, and a path toward low-memory model execution.
 
 > [!IMPORTANT]
 > The 8 GiB profile is currently an admission-control contract, not a claim
@@ -30,7 +29,7 @@ Version: `0.1.0.dev0`
 - Native C hard-budget accounting by allocation category and runtime phase
 - GLM-5.3 Flash load-peak measurement and expert-cache admission control
 - Cross-platform peak-memory measurement
-- Backward compatibility with inherited `COLI_*` environment variables
+- Temporary compatibility with legacy `COLI_*` environment variables
 - Vision, pinned-cache, and MTP budgets represented in the profile contract
 - Python CLI regression tests and native C memory-budget tests
 
@@ -56,7 +55,7 @@ From a source checkout on Windows, the launcher can also be used directly:
 .\arivan.cmd profile 8gb
 ```
 
-To use an inherited model engine, set a checkpoint directory and run Arivan:
+To use a native model engine, set a checkpoint directory and run Arivan:
 
 ```powershell
 $env:ARIVAN_MODEL = "D:\Models\your-model"
@@ -138,7 +137,7 @@ With a supported native toolchain:
 make -C c arivan-check
 ```
 
-The repository also retains Colibri's broader engine and integration tests.
+The repository also includes broader engine and integration tests.
 
 ## Project layout
 
@@ -152,13 +151,8 @@ web/                       Inherited web interface
 desktop/                   Inherited desktop shell
 ```
 
-## Origin and license
+## License
 
-Arivan began as a source fork of Colibri v1.12.0 at commit
-`dcd73832f293750086643e1f0ccd2cd6d067259c`. See [UPSTREAM.md](UPSTREAM.md) for
-the import record.
-
-Licensed under the Apache License 2.0. Original copyright and attribution
+Licensed under the Apache License 2.0. Copyright, attribution, and third-party
 notices are retained in [NOTICE](NOTICE), [LICENSE](LICENSE), and
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) as required.
