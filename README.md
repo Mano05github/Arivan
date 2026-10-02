@@ -17,8 +17,8 @@ interface, and a path toward low-memory model execution.
 
 > [!IMPORTANT]
 > The 8 GiB profile is currently an admission-control contract, not a claim
-> that GLM-5.3 Flash already runs within 8 GiB. Dense/vision paging and
-> zero-cache expert staging are the next engine milestones.
+> that GLM-5.3 Flash already runs within 8 GiB. Dense and vision paging are
+> the next engine milestones.
 
 ## Current status
 
@@ -38,6 +38,10 @@ Version: `0.1.0.dev0`
 Arivan currently refuses unsafe low-memory configurations instead of allowing
 the process to overcommit and fail later. The expert-cache floor has been
 removed; dense and vision weights remain the principal 8 GiB blockers.
+
+The native runtime currently includes adapters for GLM-5.3-Flash,
+GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6, Qwen3.8-Flash-Next,
+DeepSeek V4 Flash, and DeepSeek V4.1 Flash.
 
 ## Quick start
 
@@ -115,11 +119,10 @@ The next development milestone is correct GLM-5.3 Flash text generation below
 the 8 GiB profile's 5.25 GiB engine ceiling:
 
 1. Stream dense text weights through bounded layer windows.
-2. Add zero-cache expert execution with reusable staging buffers.
-3. Load and release vision weights by runtime phase.
-4. Replace equal per-layer pinning with a global byte-budgeted cache.
-5. Restore int8 MTP depth one and enable it only when it improves net speed.
-6. Validate tokens, memory peaks, SSD traffic, vision, tools, and MTP.
+2. Load and release vision weights by runtime phase.
+3. Replace equal per-layer pinning with a global byte-budgeted cache.
+4. Restore int8 MTP depth one and enable it only when it improves net speed.
+5. Validate tokens, memory peaks, SSD traffic, vision, tools, and MTP.
 
 Later releases will add repository tools and multiple logical agents sharing
 one serialized model process. Arivan does not promise identical performance at

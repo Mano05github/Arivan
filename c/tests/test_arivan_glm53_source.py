@@ -5,6 +5,9 @@ import unittest
 SOURCE = (Path(__file__).resolve().parents[1] / "glm53.c").read_text(
     encoding="utf-8"
 )
+MAKEFILE = (Path(__file__).resolve().parents[1] / "Makefile").read_text(
+    encoding="utf-8"
+)
 
 
 class ArivanGlm53SourceTest(unittest.TestCase):
@@ -23,6 +26,10 @@ class ArivanGlm53SourceTest(unittest.TestCase):
         self.assertIn("ARIVAN_PHASE_PREFILL", SOURCE)
         self.assertIn("ARIVAN_PHASE_DECODE", SOURCE)
         self.assertIn('glm53_memory_report(m, "session-open")', SOURCE)
+
+    def test_every_glm53_link_path_includes_native_memory_module(self):
+        self.assertIn("glm53: glm53$(EXE)", MAKEFILE)
+        self.assertIn("$(SEGMENT_BUILD_DIR)/arivan_memory.o", MAKEFILE)
 
 
 if __name__ == "__main__":

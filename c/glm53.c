@@ -3114,7 +3114,7 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
     return 0;
 }
 
-static void slot_reset(const GModel *m, KVSlot *slot) {
+static void slot_reset(GModel *m, KVSlot *slot) {
     slot_pin_drop(m, slot);
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
