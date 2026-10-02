@@ -56,9 +56,11 @@ every sparse layer does not fit, the adapter falls back to one or two bounded
 whole-model staging slots. Resident text and vision tensors now use the native
 allocation ledger. Under a native profile, transformer matrices are described
 at startup and materialized synchronously into a single-layer `dense-window`
-allocation, which is released before advancing to the next layer. The profile
-remains experimental until global embedding/head residency is bounded, vision
-weights become phase-scoped, and all forward workspaces use the native budget.
+allocation, which is released before advancing to the next layer. Token
+embeddings are read by prompt row, and the output projection runs in bounded
+vocabulary blocks while preserving tied-weight semantics. The profile remains
+experimental until vision weights become phase-scoped and all forward
+workspaces use the native budget.
 
 ## Delivery order
 

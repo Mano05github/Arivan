@@ -49,6 +49,14 @@ class ArivanGlm53SourceTest(unittest.TestCase):
         self.assertIn("ARIVAN_MEM_DENSE_WINDOW", SOURCE)
         self.assertIn("dense window invariant", SOURCE)
 
+    def test_profile_pages_embedding_and_output_head(self):
+        self.assertIn("m->embed_source = st_find", SOURCE)
+        self.assertIn("ARIVAN_MEM_EMBEDDING_WINDOW", SOURCE)
+        self.assertIn("ARIVAN_MEM_OUTPUT_HEAD_WINDOW", SOURCE)
+        self.assertIn("st_read_slice_f32(&m->S, m->embed_source->name", SOURCE)
+        self.assertIn("output_head_apply(m, logits, normed, n)", SOURCE)
+        self.assertIn("mat_materialize_rows", SOURCE)
+
     def test_every_glm53_link_path_includes_native_memory_module(self):
         self.assertIn("glm53: glm53$(EXE)", MAKEFILE)
         self.assertIn("$(SEGMENT_BUILD_DIR)/arivan_memory.o", MAKEFILE)

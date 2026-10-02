@@ -700,7 +700,9 @@ typedef struct {
     Cfg c;
     shards S;
     const float *embed, *final_norm;
+    st_tensor *embed_source;
     Mat head;
+    int head_tied;
     GLayer *layer;
     char prefix[64];
     /* Quali layer questo motore possiede davvero. Un segment ne carica un
@@ -726,6 +728,8 @@ typedef struct {
     int active_dense_layer;
     uint64_t dense_window_peak;
     int dense_window_peak_layer;
+    uint64_t embedding_window_peak;
+    uint64_t output_head_window_peak;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -1077,6 +1081,62 @@ static void mat_drop_data(GModel *m, Mat *mat, int keep_descriptor) {
     }
 }
 
+static Mat mat_materialize_rows(GModel *m, const Mat *descriptor,
+                                int row0, int rows, int force_f32) {
+    Mat out; memset(&out, 0, sizeof(out));
+    st_tensor *t = descriptor->source;
+    if (!t || row0 < 0 || rows < 1 || row0 + rows > descriptor->rows) {
+        fprintf(stderr, "invalid output-head window [%d,+%d)\n", row0, rows);
+        exit(1);
+    }
+    out.rows = rows;
+    out.columns = descriptor->columns;
+    out.budget_kind = ARIVAN_MEM_OUTPUT_HEAD_WINDOW;
+
+    if (t->dtype == 3 && !force_f32) {
+        st_tensor *qs = descriptor->scale_source;
+        const uint64_t packed_per_row = (uint64_t)(out.columns + 1) / 2;
+        const uint64_t groups = (uint64_t)out.columns / 64;
+        const uint64_t packed_bytes = (uint64_t)rows * packed_per_row;
+        const uint64_t scale_bytes = (uint64_t)rows * groups * sizeof(float);
+        glm53_memory_reserve_or_die(m, out.budget_kind,
+                                    packed_bytes + scale_bytes, t->name);
+        uint8_t *packed = malloc((size_t)packed_bytes);
+        float *scales = malloc((size_t)scale_bytes);
+        if (!packed || !scales) { fprintf(stderr, "OOM paging %s\n", t->name); exit(1); }
+        st_read_slice_raw_cap(&m->S, t->name,
+                              (int64_t)row0 * (int64_t)packed_per_row,
+                              (int64_t)packed_bytes, packed,
+                              (int64_t)packed_bytes, 1);
+        st_read_slice_f32(&m->S, qs->name, (int64_t)row0 * (int64_t)groups,
+                          (int64_t)rows * (int64_t)groups, scales, 1);
+        out.fmt = 4; out.q4 = packed; out.s = scales; out.gs = 64;
+        out.bytes = packed_bytes + scale_bytes;
+        return out;
+    }
+
+    const uint64_t values = (uint64_t)rows * out.columns;
+    const uint64_t float_bytes = values * sizeof(float);
+    const uint64_t read_bytes = values * (uint64_t)st_dtype_esz(t->dtype);
+    if (force_f32)
+        glm53_memory_reserve_or_die(m, out.budget_kind, float_bytes, t->name);
+    else
+        glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE, float_bytes, t->name);
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                read_bytes, "tensor read buffer");
+    float *buffer = malloc((size_t)float_bytes);
+    if (!buffer) { fprintf(stderr, "OOM paging %s\n", t->name); exit(1); }
+    st_read_slice_f32(&m->S, t->name, (int64_t)row0 * out.columns,
+                      (int64_t)values, buffer, 1);
+    glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, read_bytes);
+    if (force_f32) {
+        out.fmt = 0; out.f = buffer; out.bytes = float_bytes;
+        return out;
+    }
+    return quantize_loaded(m, buffer, rows, out.columns,
+                           out.budget_kind, t->name);
+}
+
 static int layer_matrix_list(GLayer *l, Mat **mats) {
     Mat *all[] = { &l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb,
                    &l->kfa, &l->kfb, &l->kb, &l->qa, &l->qb, &l->kva,
@@ -1190,6 +1250,42 @@ static void mv(float *out, const Mat *w, const float *x) {
     case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
     case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
     default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
+    }
+}
+
+static int output_head_window_rows(const GModel *m) {
+    const char *setting = getenv("ARIVAN_HEAD_WINDOW_ROWS");
+    int rows = setting ? atoi(setting) :
+               (!strcmp(m->memory_profile.name, "8gb") ? 1024 :
+                !strcmp(m->memory_profile.name, "16gb") ? 4096 : 8192);
+    if (rows < 1) rows = 1;
+    if (rows > m->c.vocab) rows = m->c.vocab;
+    return rows;
+}
+
+static void output_head_apply(GModel *m, float *logits,
+                              const float *hidden, int tokens) {
+    if (!m->dense_paging) {
+        for (int t = 0; t < tokens; t++)
+            mv(logits + (size_t)t * m->c.vocab, &m->head,
+               hidden + (size_t)t * m->c.hidden);
+        return;
+    }
+    const int block = output_head_window_rows(m);
+    for (int row0 = 0; row0 < m->c.vocab; row0 += block) {
+        const int rows = row0 + block <= m->c.vocab ? block : m->c.vocab - row0;
+        Mat window = mat_materialize_rows(m, &m->head, row0, rows, m->head_tied);
+        const uint64_t used =
+            m->memory_budget.by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW];
+        if (used > m->output_head_window_peak) m->output_head_window_peak = used;
+        for (int t = 0; t < tokens; t++)
+            mv(logits + (size_t)t * m->c.vocab + row0, &window,
+               hidden + (size_t)t * m->c.hidden);
+        mat_drop_data(m, &window, 0);
+    }
+    if (m->memory_budget.by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW] != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] output-head window was not released\n");
+        exit(1);
     }
 }
 
@@ -1434,8 +1530,10 @@ static void glm53_memory_report(const GModel *m, const char *event) {
     fprintf(stderr,
             "[ARIVAN MEMORY] event=%s phase=%s current=%.2fMiB peak=%.2fMiB "
             "phase_peak=%.2fMiB limit=%.2fMiB available=%.2fMiB "
-            "baseline=%.2fMiB weights=%.2fMiB dense_window=%.2fMiB "
-            "vision=%.2fMiB workspace=%.2fMiB dense_window_peak=%.2fMiB "
+            "baseline=%.2fMiB weights=%.2fMiB embedding_window=%.2fMiB "
+            "head_window=%.2fMiB dense_window=%.2fMiB vision=%.2fMiB "
+            "workspace=%.2fMiB embedding_window_peak=%.2fMiB "
+            "head_window_peak=%.2fMiB dense_window_peak=%.2fMiB "
             "dense_window_layer=%d rss_peak=%.2fMiB\n",
             event, arivan_memory_phase_name(b->phase),
             b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
@@ -1444,9 +1542,13 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             arivan_memory_available(b) / 1048576.0,
             b->by_kind[ARIVAN_MEM_PERMANENT] / 1048576.0,
             b->by_kind[ARIVAN_MEM_RESIDENT_WEIGHTS] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_EMBEDDING_WINDOW] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW] / 1048576.0,
             b->by_kind[ARIVAN_MEM_DENSE_WINDOW] / 1048576.0,
             b->by_kind[ARIVAN_MEM_VISION] / 1048576.0,
             b->by_kind[ARIVAN_MEM_WORKSPACE] / 1048576.0,
+            m->embedding_window_peak / 1048576.0,
+            m->output_head_window_peak / 1048576.0,
             m->dense_window_peak / 1048576.0,
             m->dense_window_peak_layer,
             compat_peak_rss_bytes() / 1048576.0);
@@ -2369,7 +2471,16 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     m->has_io = load_io;
 
     if (load_io) {
-        m->embed = load_f32(m, "%sembed_tokens.weight", P);
+        if (m->dense_paging) {
+            snprintf(probe, sizeof(probe), "%sembed_tokens.weight", P);
+            m->embed_source = st_find(&m->S, probe);
+            if (!m->embed_source || m->embed_source->rank != 2) {
+                fprintf(stderr, "missing or invalid embedding tensor %s\n", probe);
+                exit(1);
+            }
+        } else {
+            m->embed = load_f32(m, "%sembed_tokens.weight", P);
+        }
         m->final_norm = load_f32(m, "%snorm.weight", P);
     }
     /* La testa e' l'unica matrice grande fuori dagli esperti: a vocab 154880
@@ -2379,10 +2490,22 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * layer non la carica proprio: non ha logit da produrre. */
     if (load_io) {
         if (st_find(&m->S, "lm_head.weight")) {
+            const int defer = m->defer_mat_loads;
+            m->defer_mat_loads = m->dense_paging;
             m->head = load_mat(m, "lm_head.weight");
+            if (m->dense_paging)
+                m->head.budget_kind = ARIVAN_MEM_OUTPUT_HEAD_WINDOW;
+            m->defer_mat_loads = defer;
         } else {
             memset(&m->head, 0, sizeof(m->head));
-            m->head.f = m->embed;
+            if (m->dense_paging) {
+                m->head.source = m->embed_source;
+                m->head.budget_kind = ARIVAN_MEM_OUTPUT_HEAD_WINDOW;
+                m->head.deferred = 1;
+                m->head_tied = 1;
+            } else {
+                m->head.f = m->embed;
+            }
             m->head.rows = m->c.vocab;
             m->head.columns = m->c.hidden;
         }
@@ -2929,6 +3052,17 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     const int D = c->hidden;
     float *streams = malloc((size_t)n * H * D * sizeof(float));
     float *next = malloc((size_t)n * H * D * sizeof(float));
+    const uint64_t embedding_bytes = (uint64_t)n * D * sizeof(float);
+    float *embedding_window = NULL;
+    if (m->dense_paging) {
+        glm53_memory_reserve_or_die(m, ARIVAN_MEM_EMBEDDING_WINDOW,
+                                    embedding_bytes, "token embedding window");
+        embedding_window = malloc((size_t)embedding_bytes);
+        if (!embedding_window) { fprintf(stderr, "OOM allocating embedding window\n"); exit(1); }
+        const uint64_t used =
+            m->memory_budget.by_kind[ARIVAN_MEM_EMBEDDING_WINDOW];
+        if (used > m->embedding_window_peak) m->embedding_window_peak = used;
+    }
     /* l'embedding entra replicato in ognuno degli H flussi residui; sui token
      * immagine la riga viene dalla torre invece che dalla tabella */
     int consumed = 0;
@@ -2948,6 +3082,16 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                 exit(1);
             }
             row = vision + (size_t)consumed++ * D;
+        } else if (m->dense_paging) {
+            const uint64_t read_bytes =
+                (uint64_t)D * (uint64_t)st_dtype_esz(m->embed_source->dtype);
+            glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                        read_bytes, "embedding read buffer");
+            float *loaded = embedding_window + (size_t)t * D;
+            st_read_slice_f32(&m->S, m->embed_source->name,
+                              (int64_t)tokens[t] * D, D, loaded, 1);
+            glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, read_bytes);
+            row = loaded;
         } else {
             row = m->embed + (size_t)tokens[t] * D;
         }
@@ -2961,6 +3105,11 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         fprintf(stderr, "%d vision embeddings provided but only %d image tokens "
                         "are present in the prompt\n", n_vision, consumed);
         exit(1);
+    }
+    if (embedding_window) {
+        free(embedding_window);
+        glm53_memory_release_bytes(m, ARIVAN_MEM_EMBEDDING_WINDOW,
+                                   embedding_bytes);
     }
 
     streams = run_layers(m, s, streams, next, n, start,
@@ -2982,8 +3131,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     double t_head0 = now_s();
-    for (int t = 0; t < n; t++)
-        mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
+    output_head_apply(m, logits, normed, n);
     m->t_head += now_s() - t_head0;
     m->forwards++;
 

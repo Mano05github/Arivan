@@ -113,6 +113,7 @@ def main() -> int:
 
     telemetry = profiled["_stderr"]
     for field in ("event=load-complete", "weights=", "vision=", "workspace=",
+                  "embedding_window_peak=", "head_window_peak=",
                   "dense_window_peak="):
         if field not in telemetry:
             print(f"FAIL: telemetria del profilo 8gb senza {field}")
@@ -122,10 +123,18 @@ def main() -> int:
     if not peaks or max(peaks) <= 0.0:
         print("FAIL: il profilo 8gb non ha materializzato una finestra densa")
         return 1
+    for field in ("embedding_window_peak", "head_window_peak"):
+        values = [float(value) for value in
+                  re.findall(rf"{field}=([0-9.]+)MiB", telemetry)]
+        if not values or max(values) <= 0.0:
+            print(f"FAIL: il profilo 8gb non ha materializzato {field}")
+            return 1
     closed = [line for line in telemetry.splitlines() if "event=session-close" in line]
-    if not closed or "dense_window=0.00MiB" not in closed[-1]:
-        print("FAIL: la finestra densa non e' stata rilasciata a fine inferenza")
-        return 1
+    for field in ("embedding_window=0.00MiB", "head_window=0.00MiB",
+                  "dense_window=0.00MiB"):
+        if not closed or field not in closed[-1]:
+            print(f"FAIL: finestra non rilasciata a fine inferenza: {field}")
+            return 1
 
     print(f"PASS GLM-5.3 streaming: stessi token dei pesi residenti, "
           f"{misses['largo']} letture col budget largo e {misses['stretto']} "

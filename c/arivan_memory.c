@@ -165,7 +165,8 @@ int arivan_memory_plan_experts(ArivanMemoryBudget *budget,
 
 const char *arivan_memory_kind_name(ArivanMemoryKind kind) {
     static const char *const names[ARIVAN_MEM_KIND_COUNT] = {
-        "permanent", "resident-weights", "dense-window", "expert-staging",
+        "permanent", "resident-weights", "embedding-window",
+        "output-head-window", "dense-window", "expert-staging",
         "expert-pinned", "expert-lru", "kv-state", "vision", "mtp",
         "workspace", "server"
     };
