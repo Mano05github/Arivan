@@ -118,7 +118,8 @@ def main() -> int:
     telemetry = profiled["_stderr"]
     for field in ("event=load-complete", "weights=", "vision=", "workspace=",
                   "embedding_window_peak_bytes=", "head_window_peak_bytes=",
-                  "dense_window_peak_bytes=", "vision_window_peak_bytes="):
+                  "dense_window_peak_bytes=", "vision_window_peak_bytes=",
+                  "forward_workspace_peak_bytes="):
         if field not in telemetry:
             print(f"FAIL: telemetria del profilo 8gb senza {field}")
             return 1
@@ -133,6 +134,11 @@ def main() -> int:
         if not values or max(values) <= 0.0:
             print(f"FAIL: il profilo 8gb non ha materializzato {field}")
             return 1
+    workspace_peaks = [int(value) for value in re.findall(
+        r"forward_workspace_peak_bytes=([0-9]+)", telemetry)]
+    if not workspace_peaks or max(workspace_peaks) <= 0:
+        print("FAIL: il profilo 8gb non ha contabilizzato il workspace forward")
+        return 1
     vision_peaks = [int(value) for value in re.findall(
         r"vision_window_peak_bytes=([0-9]+)", profiled_text["_stderr"])]
     if not vision_peaks or max(vision_peaks) != 0:
@@ -140,7 +146,7 @@ def main() -> int:
         return 1
     closed = [line for line in telemetry.splitlines() if "event=session-close" in line]
     for field in ("embedding_window_bytes=0", "head_window_bytes=0",
-                  "dense_window_bytes=0"):
+                  "dense_window_bytes=0", "workspace_bytes=0"):
         if not closed or field not in closed[-1]:
             print(f"FAIL: finestra non rilasciata a fine inferenza: {field}")
             return 1

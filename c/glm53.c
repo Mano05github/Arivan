@@ -753,6 +753,11 @@ typedef struct {
     uint64_t output_head_window_peak;
     uint64_t vision_window_peak;
     uint64_t vision_workspace_peak;
+    uint64_t forward_workspace_peak;
+    uint64_t dense_workspace_baseline;
+    uint64_t dense_admission_peak;
+    uint64_t output_head_admission_peak;
+    int paging_plan_ready;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -796,6 +801,48 @@ static void glm53_memory_release_bytes(GModel *m, ArivanMemoryKind kind,
                 arivan_memory_kind_name(kind));
         exit(1);
     }
+}
+
+typedef union {
+    struct { uint64_t budget_bytes; } meta;
+    long double align_long_double;
+    void *align_pointer;
+} Glm53TrackedHeader;
+
+static void glm53_workspace_peak_update(GModel *m) {
+    if (!m->memory_active) return;
+    const uint64_t live = m->memory_budget.by_kind[ARIVAN_MEM_WORKSPACE];
+    if (live > m->forward_workspace_peak) m->forward_workspace_peak = live;
+}
+
+static void *glm53_tracked_alloc(GModel *m, ArivanMemoryKind kind,
+                                 uint64_t payload_bytes, const char *label) {
+    uint64_t allocation_bytes;
+    if (payload_bytes > SIZE_MAX ||
+        arivan_memory_checked_add(payload_bytes, sizeof(Glm53TrackedHeader),
+                                  &allocation_bytes) != 0 ||
+        allocation_bytes > SIZE_MAX) {
+        fprintf(stderr, "%s size overflow\n", label);
+        exit(1);
+    }
+    glm53_memory_reserve_or_die(m, kind, allocation_bytes, label);
+    Glm53TrackedHeader *header = malloc((size_t)allocation_bytes);
+    if (!header) {
+        glm53_memory_release_bytes(m, kind, allocation_bytes);
+        fprintf(stderr, "OOM allocating %s\n", label);
+        exit(1);
+    }
+    header->meta.budget_bytes = m->memory_active ? allocation_bytes : 0;
+    if (kind == ARIVAN_MEM_WORKSPACE) glm53_workspace_peak_update(m);
+    return header + 1;
+}
+
+static void glm53_tracked_free(GModel *m, ArivanMemoryKind kind, void *pointer) {
+    if (!pointer) return;
+    Glm53TrackedHeader *header = (Glm53TrackedHeader *)pointer - 1;
+    const uint64_t budget_bytes = header->meta.budget_bytes;
+    free(header);
+    glm53_memory_release_bytes(m, kind, budget_bytes);
 }
 
 static void glm53_memory_reclassify_or_die(GModel *m, ArivanMemoryKind from,
@@ -1181,6 +1228,8 @@ static void layer_window_load(GModel *m, int index) {
                 m->active_dense_layer);
         exit(1);
     }
+    m->dense_workspace_baseline =
+        m->memory_budget.by_kind[ARIVAN_MEM_WORKSPACE];
     GLayer *l = &m->layer[index];
     Mat *mats[25];
     const int count = layer_matrix_list(l, mats);
@@ -1216,11 +1265,13 @@ static void layer_window_release(GModel *m, int index) {
         mat_drop_data(m, mats[i], mats[i]->deferred);
     m->active_dense_layer = -1;
     if (m->memory_budget.by_kind[ARIVAN_MEM_DENSE_WINDOW] != 0 ||
-        m->memory_budget.by_kind[ARIVAN_MEM_WORKSPACE] != 0) {
+        m->memory_budget.by_kind[ARIVAN_MEM_WORKSPACE] !=
+            m->dense_workspace_baseline) {
         fprintf(stderr, "[ARIVAN MEMORY] layer %d left window/workspace bytes reserved\n",
                 index);
         exit(1);
     }
+    m->dense_workspace_baseline = 0;
 }
 
 /* Come mv ma su un blocco di righe contigue: serve alle matrici che tengono
@@ -1562,11 +1613,13 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             "workspace=%.2fMiB embedding_window_peak=%.2fMiB "
             "head_window_peak=%.2fMiB dense_window_peak=%.2fMiB "
             "vision_window_peak=%.2fMiB vision_workspace_peak=%.2fMiB "
+            "forward_workspace_peak=%.2fMiB "
             "embedding_window_bytes=%llu head_window_bytes=%llu "
             "dense_window_bytes=%llu embedding_window_peak_bytes=%llu "
             "head_window_peak_bytes=%llu dense_window_peak_bytes=%llu "
             "vision_window_bytes=%llu vision_bytes=%llu "
             "vision_window_peak_bytes=%llu vision_workspace_peak_bytes=%llu "
+            "workspace_bytes=%llu forward_workspace_peak_bytes=%llu "
             "dense_window_layer=%d rss_peak=%.2fMiB\n",
             event, arivan_memory_phase_name(b->phase),
             b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
@@ -1586,6 +1639,7 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             m->dense_window_peak / 1048576.0,
             m->vision_window_peak / 1048576.0,
             m->vision_workspace_peak / 1048576.0,
+            m->forward_workspace_peak / 1048576.0,
             (unsigned long long)b->by_kind[ARIVAN_MEM_EMBEDDING_WINDOW],
             (unsigned long long)b->by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW],
             (unsigned long long)b->by_kind[ARIVAN_MEM_DENSE_WINDOW],
@@ -1596,6 +1650,8 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             (unsigned long long)b->by_kind[ARIVAN_MEM_VISION],
             (unsigned long long)m->vision_window_peak,
             (unsigned long long)m->vision_workspace_peak,
+            (unsigned long long)b->by_kind[ARIVAN_MEM_WORKSPACE],
+            (unsigned long long)m->forward_workspace_peak,
             m->dense_window_peak_layer,
             compat_peak_rss_bytes() / 1048576.0);
 }
@@ -3141,29 +3197,70 @@ static void vision_embeddings_release(GModel *m, float *embeddings, int tokens) 
 }
 
 /* ---------- sessione ---------- */
-static uint64_t session_budget_bytes(const GModel *m, int cap) {
+static int session_budget_add(uint64_t *total, const uint64_t *factors,
+                              size_t count) {
+    uint64_t bytes = 1;
+    for (size_t i = 0; i < count; i++)
+        if (arivan_memory_checked_mul(bytes, factors[i], &bytes) != 0)
+            return -1;
+    return arivan_memory_checked_add(*total, bytes, total);
+}
+
+static int session_budget_bytes(const GModel *m, int cap, uint64_t *result) {
     const Cfg *c = &m->c;
-    uint64_t bytes = sizeof(GSession) +
-                     (uint64_t)c->n_layers * sizeof(GLayerState);
-    if (c->kda_proj)
-        bytes += (uint64_t)coli_kda_scratch_floats(
-                     c->kda_heads, c->kda_hd, c->kda_hd) * sizeof(float);
+    uint64_t bytes = sizeof(GSession);
+    if (!result || cap < 0 || c->n_layers < 0 || c->kv_lora < 0 ||
+        c->index_hd < 0 || c->kda_proj < 0 || c->kda_heads < 0 ||
+        c->kda_hd < 0 || c->conv_k < 0)
+        return -1;
+    const uint64_t layer_metadata[] = {
+        (uint64_t)c->n_layers, sizeof(GLayerState)
+    };
+    if (session_budget_add(&bytes, layer_metadata, 2) != 0) return -1;
+    if (c->kda_proj) {
+        const uint64_t scratch[] = {
+            (uint64_t)coli_kda_scratch_floats(
+                c->kda_heads, c->kda_hd, c->kda_hd), sizeof(float)
+        };
+        if (session_budget_add(&bytes, scratch, 2) != 0) return -1;
+    }
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_full[i]) {
-            bytes += (uint64_t)cap *
-                     (uint64_t)(c->kv_lora + 2 * c->index_hd) * sizeof(float);
+            const uint64_t latent[] = {
+                (uint64_t)cap, (uint64_t)c->kv_lora, sizeof(float)
+            };
+            const uint64_t index[] = {
+                2, (uint64_t)cap, (uint64_t)c->index_hd, sizeof(float)
+            };
+            if (session_budget_add(&bytes, latent, 3) != 0 ||
+                session_budget_add(&bytes, index, 4) != 0)
+                return -1;
         } else if (c->kda_proj) {
-            bytes += (uint64_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float);
-            bytes += (uint64_t)3 * c->kda_proj * c->conv_k * sizeof(float);
+            const uint64_t state[] = {
+                (uint64_t)c->kda_heads, (uint64_t)c->kda_hd,
+                (uint64_t)c->kda_hd, sizeof(float)
+            };
+            const uint64_t window[] = {
+                3, (uint64_t)c->kda_proj, (uint64_t)c->conv_k, sizeof(float)
+            };
+            if (session_budget_add(&bytes, state, 4) != 0 ||
+                session_budget_add(&bytes, window, 4) != 0)
+                return -1;
         }
     }
-    return bytes;
+    *result = bytes;
+    return 0;
 }
 
 static GSession *session_open(GModel *m, int cap) {
     const Cfg *c = &m->c;
     glm53_memory_set_phase(m, ARIVAN_PHASE_PREFILL);
-    const uint64_t budget_bytes = session_budget_bytes(m, cap);
+    uint64_t budget_bytes;
+    if (session_budget_bytes(m, cap, &budget_bytes) != 0 ||
+        budget_bytes > SIZE_MAX) {
+        fprintf(stderr, "session allocation size overflow for %d tokens\n", cap);
+        exit(1);
+    }
     if (m->memory_active && arivan_memory_reserve(
             &m->memory_budget, ARIVAN_MEM_KV_STATE, budget_bytes) != 0) {
         fprintf(stderr,
@@ -3227,6 +3324,370 @@ static void session_close(GModel *m, GSession *s) {
         arivan_memory_release(&m->memory_budget, ARIVAN_MEM_KV_STATE,
                               budget_bytes);
     glm53_memory_report(m, "session-close");
+}
+
+static int workspace_add_factors(uint64_t *total, const uint64_t *factors,
+                                 size_t count) {
+    uint64_t value = 1;
+    for (size_t i = 0; i < count; i++)
+        if (arivan_memory_checked_mul(value, factors[i], &value) != 0)
+            return -1;
+    return arivan_memory_checked_add(*total, value, total);
+}
+
+static int workspace_product(const uint64_t *factors, size_t count,
+                             uint64_t *value) {
+    uint64_t total = 0;
+    if (workspace_add_factors(&total, factors, count) != 0) return -1;
+    *value = total;
+    return 0;
+}
+
+static int matrix_storage_bytes(uint64_t rows, uint64_t columns, int bits,
+                                uint64_t *bytes) {
+    if (!bytes || rows < 1 || columns < 1) return -1;
+    const uint64_t dims[] = {rows, columns};
+    uint64_t values;
+    if (workspace_product(dims, 2, &values) != 0) return -1;
+    if (bits == 32) {
+        const uint64_t factors[] = {values, sizeof(float)};
+        return workspace_product(factors, 2, bytes);
+    }
+    uint64_t levels, scales;
+    if (bits == 4 && columns % 64 == 0) {
+        const uint64_t level_factors[] = {
+            rows, (columns + 1) / 2
+        };
+        const uint64_t scale_factors[] = {
+            rows, columns / 64, sizeof(float)
+        };
+        if (workspace_product(level_factors, 2, &levels) != 0 ||
+            workspace_product(scale_factors, 3, &scales) != 0)
+            return -1;
+    } else {
+        const uint64_t level_factors[] = {
+            rows, columns
+        };
+        const uint64_t scale_factors[] = {
+            rows, sizeof(float)
+        };
+        if (workspace_product(level_factors, 2, &levels) != 0 ||
+            workspace_product(scale_factors, 2, &scales) != 0)
+            return -1;
+    }
+    return arivan_memory_checked_add(levels, scales, bytes);
+}
+
+static int paging_peak_update(uint64_t live, uint64_t extra,
+                              uint64_t *peak) {
+    uint64_t candidate;
+    if (arivan_memory_checked_add(live, extra, &candidate) != 0) return -1;
+    if (candidate > *peak) *peak = candidate;
+    return 0;
+}
+
+/* Simulate mat_materialize without touching the model. `live` is the dense
+ * window accumulated by matrices already loaded in this layer; `peak` also
+ * includes the temporary f32 source that overlaps its quantized destination. */
+static int matrix_materialization_plan(const Mat *mat, uint64_t *live,
+                                       uint64_t *peak) {
+    if (!mat || mat->f || mat->q8 || mat->q4 || !mat->source) return 0;
+    const st_tensor *t = mat->source;
+    if (t->numel < 0 || t->nbytes < 0) return -1;
+    uint64_t output_bytes;
+    if (t->dtype == 3) {
+        if (!mat->scale_source || mat->scale_source->numel < 0) return -1;
+        const uint64_t scale_factors[] = {
+            (uint64_t)mat->scale_source->numel, sizeof(float)
+        };
+        uint64_t scale_bytes;
+        if (workspace_product(scale_factors, 2, &scale_bytes) != 0 ||
+            arivan_memory_checked_add((uint64_t)t->nbytes, scale_bytes,
+                                      &output_bytes) != 0 ||
+            arivan_memory_checked_add(*live, output_bytes, live) != 0)
+            return -1;
+        if (*live > *peak) *peak = *live;
+        return 0;
+    }
+
+    const uint64_t source_factors[] = {
+        (uint64_t)t->numel, sizeof(float)
+    };
+    uint64_t source_bytes;
+    const int bits = glm53_dense_bits();
+    if (workspace_product(source_factors, 2, &source_bytes) != 0 ||
+        matrix_storage_bytes(mat->rows, mat->columns, bits,
+                             &output_bytes) != 0)
+        return -1;
+    if (bits == 32) {
+        if (arivan_memory_checked_add(*live, source_bytes, live) != 0)
+            return -1;
+        if (*live > *peak) *peak = *live;
+        return 0;
+    }
+    uint64_t overlap;
+    if (arivan_memory_checked_add(source_bytes, output_bytes, &overlap) != 0 ||
+        paging_peak_update(*live, overlap, peak) != 0 ||
+        arivan_memory_checked_add(*live, output_bytes, live) != 0)
+        return -1;
+    return 0;
+}
+
+static int absorbed_kvb_materialization_plan(GModel *m, int layer,
+                                             uint64_t *live, uint64_t *peak) {
+    char name[512];
+    snprintf(name, sizeof(name), "%slayers.%d.self_attn.kv_b_proj.weight",
+             m->prefix, layer);
+    const st_tensor *t = st_find(&m->S, name);
+    if (!t || t->numel < 0) return -1;
+    const Cfg *c = &m->c;
+    const uint64_t whole_factors[] = {(uint64_t)t->numel, sizeof(float)};
+    const uint64_t kt_factors[] = {
+        (uint64_t)c->n_heads, (uint64_t)c->kv_lora,
+        (uint64_t)c->qk_nope, sizeof(float)
+    };
+    const uint64_t vv_factors[] = {
+        (uint64_t)c->n_heads, (uint64_t)c->v_head,
+        (uint64_t)c->kv_lora, sizeof(float)
+    };
+    uint64_t whole, kt, vv, initial, temporary;
+    if (workspace_product(whole_factors, 2, &whole) != 0 ||
+        workspace_product(kt_factors, 4, &kt) != 0 ||
+        workspace_product(vv_factors, 4, &vv) != 0 ||
+        arivan_memory_checked_add(whole, kt, &initial) != 0 ||
+        arivan_memory_checked_add(initial, vv, &initial) != 0 ||
+        paging_peak_update(*live, initial, peak) != 0 ||
+        arivan_memory_checked_add(*live, kt, &temporary) != 0 ||
+        arivan_memory_checked_add(temporary, vv, &temporary) != 0)
+        return -1;
+
+    const int bits = glm53_dense_bits();
+    uint64_t kt_out, vv_out;
+    if (matrix_storage_bytes((uint64_t)c->n_heads * c->kv_lora, c->qk_nope,
+                             bits, &kt_out) != 0 ||
+        matrix_storage_bytes((uint64_t)c->n_heads * c->v_head, c->kv_lora,
+                             bits, &vv_out) != 0)
+        return -1;
+    if (bits == 32) {
+        if (arivan_memory_checked_add(*live, kt, live) != 0 ||
+            arivan_memory_checked_add(*live, vv, live) != 0)
+            return -1;
+        if (*live > *peak) *peak = *live;
+        return 0;
+    }
+    if (paging_peak_update(temporary, kt_out, peak) != 0 ||
+        arivan_memory_checked_add(*live, vv, &temporary) != 0 ||
+        arivan_memory_checked_add(temporary, kt_out, &temporary) != 0 ||
+        paging_peak_update(temporary, vv_out, peak) != 0 ||
+        arivan_memory_checked_add(*live, kt_out, live) != 0 ||
+        arivan_memory_checked_add(*live, vv_out, live) != 0)
+        return -1;
+    return 0;
+}
+
+static int dense_layer_paging_peak(GModel *m, uint64_t *peak) {
+    uint64_t maximum = 0;
+    for (int index = m->layer_begin; index < m->layer_end; index++) {
+        uint64_t live = 0, layer_peak = 0;
+        Mat *mats[25];
+        const int count = layer_matrix_list(&m->layer[index], mats);
+        for (int i = 0; i < count; i++)
+            if (matrix_materialization_plan(mats[i], &live,
+                                            &layer_peak) != 0)
+                return -1;
+        if (m->c.is_full[index] &&
+            absorbed_kvb_materialization_plan(m, index, &live,
+                                               &layer_peak) != 0)
+            return -1;
+        if (layer_peak > maximum) maximum = layer_peak;
+    }
+    *peak = maximum;
+    return 0;
+}
+
+static int output_head_paging_peak(const GModel *m, uint64_t *peak) {
+    const Mat *head = &m->head;
+    const st_tensor *t = head->source;
+    if (!t || t->numel < 0 || t->nbytes < 0) return -1;
+    const int rows = output_head_window_rows(m);
+    if (t->dtype == 3 && !m->head_tied) {
+        if (!head->scale_source) return -1;
+        const uint64_t packed_factors[] = {
+            (uint64_t)rows, ((uint64_t)head->columns + 1) / 2
+        };
+        const uint64_t scale_factors[] = {
+            (uint64_t)rows, (uint64_t)head->columns / 64, sizeof(float)
+        };
+        uint64_t packed, scales;
+        if (workspace_product(packed_factors, 2, &packed) != 0 ||
+            workspace_product(scale_factors, 3, &scales) != 0)
+            return -1;
+        return arivan_memory_checked_add(packed, scales, peak);
+    }
+    const uint64_t value_factors[] = {
+        (uint64_t)rows, (uint64_t)head->columns
+    };
+    uint64_t values, float_bytes, read_bytes;
+    if (workspace_product(value_factors, 2, &values) != 0) return -1;
+    const uint64_t float_factors[] = {values, sizeof(float)};
+    const int element_size = st_dtype_esz(t->dtype);
+    if (element_size < 1 ||
+        workspace_product(float_factors, 2, &float_bytes) != 0) return -1;
+    const uint64_t read_factors[] = {values, (uint64_t)element_size};
+    if (workspace_product(read_factors, 2, &read_bytes) != 0 ||
+        arivan_memory_checked_add(float_bytes, read_bytes, peak) != 0)
+        return -1;
+    if (!m->head_tied && glm53_dense_bits() != 32) {
+        uint64_t output_bytes, quantization_peak;
+        if (matrix_storage_bytes(rows, head->columns, glm53_dense_bits(),
+                                 &output_bytes) != 0 ||
+            arivan_memory_checked_add(float_bytes, output_bytes,
+                                      &quantization_peak) != 0)
+            return -1;
+        if (quantization_peak > *peak) *peak = quantization_peak;
+    }
+    return 0;
+}
+
+/* Maximum mutually-exclusive paging transient while the base forward
+ * workspace is live: embedding rows, one dense layer, or one head window. */
+static int forward_paging_peak(GModel *m, int tokens, uint64_t *peak) {
+    if (!m->dense_paging) { *peak = 0; return 0; }
+    const int embed_element_size = m->embed_source
+        ? st_dtype_esz(m->embed_source->dtype) : 0;
+    if (tokens < 1 || embed_element_size < 1) return -1;
+    const uint64_t embedding_factors[] = {
+        (uint64_t)tokens, (uint64_t)m->c.hidden, sizeof(float)
+    };
+    const uint64_t read_factors[] = {
+        (uint64_t)m->c.hidden, (uint64_t)embed_element_size
+    };
+    uint64_t embedding, read, embedding_peak;
+    if (workspace_product(embedding_factors, 3, &embedding) != 0 ||
+        workspace_product(read_factors, 2, &read) != 0 ||
+        arivan_memory_checked_add(embedding, read, &embedding_peak) != 0)
+        return -1;
+    if (!m->paging_plan_ready) {
+        if (dense_layer_paging_peak(m, &m->dense_admission_peak) != 0 ||
+            output_head_paging_peak(m, &m->output_head_admission_peak) != 0)
+            return -1;
+        m->paging_plan_ready = 1;
+    }
+    *peak = embedding_peak;
+    if (m->dense_admission_peak > *peak) *peak = m->dense_admission_peak;
+    if (m->output_head_admission_peak > *peak)
+        *peak = m->output_head_admission_peak;
+    return 0;
+}
+
+/* Conservative upper bound for every ordinary allocation that can be live
+ * inside one text forward. Branches that cannot coexist are intentionally
+ * included together: profile admission may leave a few MiB unused, but it can
+ * never fail halfway through a layer after recurrent state has been updated. */
+static int forward_workspace_plan(const GModel *m, const GSession *s, int tokens,
+                                  uint64_t *scratch_bytes,
+                                  uint64_t *logit_payload_bytes) {
+    const Cfg *c = &m->c;
+    if (!s || !scratch_bytes || !logit_payload_bytes || tokens < 1 ||
+        c->hidden < 1 || c->hc_mult < 1 || c->vocab < 1)
+        return -1;
+    uint64_t total = 0;
+#define WS_ADD(...) do {                                                       \
+        const uint64_t factors[] = {__VA_ARGS__};                              \
+        if (workspace_add_factors(&total, factors,                             \
+                sizeof(factors) / sizeof(factors[0])) != 0) return -1;          \
+    } while (0)
+
+    /* The two residual banks remain live for the whole layer stack. */
+    WS_ADD(2, tokens, c->hc_mult, c->hidden, sizeof(float));
+    /* run_layers common scratch. */
+    WS_ADD(3, tokens, c->hidden, sizeof(float));
+    WS_ADD(tokens, c->hc_mult, sizeof(float));
+    WS_ADD(tokens, c->hc_mult, c->hc_mult, sizeof(float));
+
+    /* KDA scratch (the recurrence scratch itself is session/KV state). */
+    if (c->kda_proj > 0) {
+        WS_ADD(6, c->kda_proj, sizeof(float));
+        WS_ADD(c->kda_heads, sizeof(float));
+        WS_ADD(c->kda_hd, sizeof(float));
+    }
+
+    /* Full-attention MLA and sparse-index scratch. */
+    const int seen = s->filled + tokens;
+    const int width = coli_sparse_index_width(
+        c->index_topk, c->index_kpool, c->index_kpool_tail);
+    if (seen < 0 || width < 0) return -1;
+    WS_ADD(tokens, c->q_lora, sizeof(float));
+    WS_ADD(tokens, c->n_heads, c->qk_nope, sizeof(float));
+    WS_ADD(tokens, c->n_heads, c->kv_lora, sizeof(float));
+    WS_ADD(tokens, c->index_nh, c->index_hd, sizeof(float));
+    WS_ADD(tokens, c->index_nh, sizeof(float));
+    WS_ADD(seen, sizeof(unsigned char));
+    WS_ADD(tokens, width, sizeof(int));
+    WS_ADD(c->n_heads, c->v_head, sizeof(float));
+    WS_ADD(c->kv_lora, sizeof(float));
+    WS_ADD(width, sizeof(float));
+
+    /* Dense and routed FFN paths, including the bounded streaming metadata. */
+    const int wide = c->dense_inter > c->moe_inter
+        ? c->dense_inter : c->moe_inter;
+    WS_ADD(2, wide, sizeof(float));
+    WS_ADD(tokens, c->topk, sizeof(int));
+    WS_ADD(tokens, c->topk, sizeof(float));
+    WS_ADD(c->n_experts, sizeof(float));
+    WS_ADD(2, wide, sizeof(float));
+    WS_ADD(c->hidden, sizeof(float));
+    if (m->streaming) {
+        WS_ADD(tokens, c->topk, sizeof(int));
+        int cache_cap = 0;
+        if (m->ecache)
+            for (int i = m->layer_begin; i < m->layer_end; i++)
+                if (m->ecache[i].cap > cache_cap) cache_cap = m->ecache[i].cap;
+        if (cache_cap > 0) {
+            WS_ADD(2, cache_cap, sizeof(int));
+#ifdef COLI_METAL
+            WS_ADD(6, cache_cap, sizeof(void *));
+            WS_ADD(2, cache_cap, sizeof(int));
+            WS_ADD(tokens, c->topk, sizeof(int));
+            WS_ADD(tokens, c->topk, sizeof(float));
+            WS_ADD(tokens, c->topk, c->hidden, sizeof(float));
+#endif
+        }
+    }
+
+    /* Final collapse and normalization after run_layers releases its scratch. */
+    WS_ADD(2, tokens, c->hidden, sizeof(float));
+#undef WS_ADD
+
+    uint64_t logits = 0;
+    if (arivan_memory_checked_mul((uint64_t)tokens, (uint64_t)c->vocab,
+                                  &logits) != 0 ||
+        arivan_memory_checked_mul(logits, sizeof(float), &logits) != 0)
+        return -1;
+    *scratch_bytes = total;
+    *logit_payload_bytes = logits;
+    return 0;
+}
+
+static int forward_admission_bytes(GModel *m, const GSession *s, int tokens,
+                                   uint64_t *scratch_bytes,
+                                   uint64_t *logit_payload_bytes,
+                                   uint64_t *total_bytes) {
+    uint64_t logits_with_header, paging_peak = 0, total;
+    if (!total_bytes ||
+        forward_workspace_plan(m, s, tokens, scratch_bytes,
+                               logit_payload_bytes) != 0 ||
+        arivan_memory_checked_add(*logit_payload_bytes,
+                                  sizeof(Glm53TrackedHeader),
+                                  &logits_with_header) != 0 ||
+        arivan_memory_checked_add(*scratch_bytes, logits_with_header,
+                                  &total) != 0)
+        return -1;
+    if (forward_paging_peak(m, tokens, &paging_peak) != 0 ||
+        arivan_memory_checked_add(total, paging_peak, &total) != 0)
+        return -1;
+    *total_bytes = total;
+    return 0;
 }
 
 /* I layer [begin, end) su `streams`, che entra e esce come H flussi residui
@@ -3397,9 +3858,6 @@ static unsigned long long g_echo_id = 0;
 static Tok   *g_echo_tok = NULL;
 static int    g_echo_base = 0;            /* posizione assoluta del primo token letto */
 static const float *g_echo_pin_logit = NULL;
-static float *g_echo_prev = NULL;         /* ultima riga di logit del pezzo precedente: il
-                                           * prefill va a pezzi, e chi predice il primo token
-                                           * di un pezzo sta in quello prima */
 
 static void glm_echo(unsigned long long id, int pos, int token,
                      const float *lo, int V, int k){
@@ -3416,14 +3874,49 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     const Cfg *c = &m->c;
     const int H = c->hc_mult;
     const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
-    if (start + n > s->cap) {
-        fprintf(stderr, "context exhausted: %d positions of %d\n", start + n, s->cap);
+    if (n < 1 || start < 0 || start > s->cap || n > s->cap - start) {
+        fprintf(stderr, "context exhausted: %d existing + %d requested of %d\n",
+                start, n, s->cap);
         exit(1);
     }
     const int D = c->hidden;
+    uint64_t scratch_bytes = 0, logit_payload_bytes = 0, admission_bytes = 0;
+    if (forward_admission_bytes(m, s, n, &scratch_bytes,
+                                &logit_payload_bytes, &admission_bytes) != 0) {
+        fprintf(stderr, "forward workspace size overflow for %d tokens\n", n);
+        exit(1);
+    }
+    uint64_t embedding_bytes = 0;
+    if (arivan_memory_checked_mul((uint64_t)n, (uint64_t)D,
+                                  &embedding_bytes) != 0 ||
+        arivan_memory_checked_mul(embedding_bytes, sizeof(float),
+                                  &embedding_bytes) != 0) {
+        fprintf(stderr, "embedding window size overflow for %d tokens\n", n);
+        exit(1);
+    }
+    if (m->memory_active &&
+        admission_bytes > arivan_memory_available(&m->memory_budget)) {
+        fprintf(stderr,
+                "[ARIVAN MEMORY] %s profile cannot admit a %d-token forward: "
+                "%.2f MiB required, %.2f MiB available\n",
+                m->memory_profile.name, n, admission_bytes / 1048576.0,
+                arivan_memory_available(&m->memory_budget) / 1048576.0);
+        exit(1);
+    }
+    float *logits = glm53_tracked_alloc(m, ARIVAN_MEM_WORKSPACE,
+                                        logit_payload_bytes, "forward logits");
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                scratch_bytes, "text forward workspace");
+    glm53_workspace_peak_update(m);
     float *streams = malloc((size_t)n * H * D * sizeof(float));
     float *next = malloc((size_t)n * H * D * sizeof(float));
-    const uint64_t embedding_bytes = (uint64_t)n * D * sizeof(float);
+    if (!streams || !next) {
+        free(next); free(streams);
+        glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, scratch_bytes);
+        glm53_tracked_free(m, ARIVAN_MEM_WORKSPACE, logits);
+        fprintf(stderr, "OOM allocating residual streams\n");
+        exit(1);
+    }
     float *embedding_window = NULL;
     if (m->dense_paging) {
         glm53_memory_reserve_or_die(m, ARIVAN_MEM_EMBEDDING_WINDOW,
@@ -3500,7 +3993,6 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     for (int t = 0; t < n; t++)
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
 
-    float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     double t_head0 = now_s();
     output_head_apply(m, logits, normed, n);
     m->t_head += now_s() - t_head0;
@@ -3508,6 +4000,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     free(normed); free(collapsed);
     free(next); free(streams);
+    glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, scratch_bytes);
     s->filled = start + n;
     return logits;
 }
@@ -3547,13 +4040,65 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     }
     if (chunk > n) chunk = n;
 
-    float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
-    if (keep_all && !all) { fprintf(stderr, "OOM allocating prefill logits\n"); exit(1); }
+    uint64_t all_bytes = 0;
+    if (keep_all &&
+        (arivan_memory_checked_mul((uint64_t)n, (uint64_t)c->vocab,
+                                   &all_bytes) != 0 ||
+         arivan_memory_checked_mul(all_bytes, sizeof(float), &all_bytes) != 0)) {
+        fprintf(stderr, "prefill logits size overflow\n");
+        exit(1);
+    }
+    float *all = keep_all ? glm53_tracked_alloc(
+        m, ARIVAN_MEM_WORKSPACE, all_bytes, "prefill logits") : NULL;
     float *last = NULL;
     int used_vision = 0;
 
-    for (int at = 0; at < n; at += chunk) {
-        const int here = at + chunk <= n ? chunk : n - at;
+    for (int at = 0; at < n; ) {
+        int here = chunk <= n - at ? chunk : n - at;
+        if (m->memory_active) {
+            uint64_t scratch_bytes, logit_bytes, required;
+            if (forward_admission_bytes(m, s, here, &scratch_bytes,
+                                        &logit_bytes, &required) != 0) {
+                fprintf(stderr, "forward workspace size overflow for %d tokens\n",
+                        here);
+                exit(1);
+            }
+            const uint64_t available = arivan_memory_available(&m->memory_budget);
+            if (required > available) {
+                int low = 1, high = here - 1, best = 0;
+                while (low <= high) {
+                    const int candidate = low + (high - low) / 2;
+                    uint64_t candidate_scratch, candidate_logits, candidate_bytes;
+                    if (forward_admission_bytes(m, s, candidate,
+                                                &candidate_scratch,
+                                                &candidate_logits,
+                                                &candidate_bytes) == 0 &&
+                        candidate_bytes <= available) {
+                        best = candidate;
+                        low = candidate + 1;
+                    } else {
+                        high = candidate - 1;
+                    }
+                }
+                if (!best) {
+                    uint64_t one_scratch = 0, one_logits = 0, one_required = 0;
+                    (void)forward_admission_bytes(m, s, 1, &one_scratch,
+                                                  &one_logits, &one_required);
+                    fprintf(stderr,
+                            "[ARIVAN MEMORY] %s profile cannot admit even a "
+                            "one-token forward: %.2f MiB required, %.2f MiB available\n",
+                            m->memory_profile.name, one_required / 1048576.0,
+                            available / 1048576.0);
+                    exit(1);
+                }
+                if (arivan_memory_telemetry_enabled())
+                    fprintf(stderr,
+                            "[ARIVAN MEMORY] event=prefill-chunk-reduced "
+                            "requested=%d selected=%d available_bytes=%llu\n",
+                            here, best, (unsigned long long)available);
+                here = best;
+            }
+        }
         /* Gli embedding dell'immagine vanno divisi come i token: a ogni pezzo
          * quelli dei segnaposto che contiene, altrimenti il conto non torna e
          * il motore si ferma -- che e' quello che deve fare. */
@@ -3568,7 +4113,7 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         if (keep_all) {
             memcpy(all + (size_t)at * c->vocab, part,
                    (size_t)here * c->vocab * sizeof(float));
-            free(part);
+            glm53_tracked_free(m, ARIVAN_MEM_WORKSPACE, part);
         } else {
             /* La posizione p predice il token p+1: il predittore del token in
              * `at+i` sta in `at+i-1`, che e la riga i-1 di questo pezzo, o
@@ -3577,29 +4122,23 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                 for (int i = 0; i < here; i++) {
                     const float *pred;
                     if (at + i == 0)   pred = g_echo_pin_logit;
-                    else if (i == 0)   pred = g_echo_prev;
+                    else if (i == 0)   pred = last;
                     else               pred = part + (size_t)(i - 1) * c->vocab;
                     glm_echo(g_echo_id, g_echo_base + at + i, tokens[at + i],
                              pred, c->vocab, pred ? g_echo_k : 0);
                 }
-                if (!g_echo_prev)
-                    g_echo_prev = malloc((size_t)c->vocab * sizeof(float));
-                if (g_echo_prev)
-                    memcpy(g_echo_prev, part + (size_t)(here - 1) * c->vocab,
-                           (size_t)c->vocab * sizeof(float));
             }
-            free(last);
+            glm53_tracked_free(m, ARIVAN_MEM_WORKSPACE, last);
             last = part;
             if (here > 1) {
-                /* si tiene solo l'ultima riga */
-                float *tail = malloc((size_t)c->vocab * sizeof(float));
-                if (!tail) { fprintf(stderr, "OOM allocating logits\n"); exit(1); }
-                memcpy(tail, last + (size_t)(here - 1) * c->vocab,
-                       (size_t)c->vocab * sizeof(float));
-                free(last);
-                last = tail;
+                /* Keep only the last logical row without allocating after the
+                 * session has already advanced. The reservation remains a
+                 * conservative upper bound until the caller releases it. */
+                memmove(last, last + (size_t)(here - 1) * c->vocab,
+                        (size_t)c->vocab * sizeof(float));
             }
         }
+        at += here;
     }
     if (vision && used_vision != n_vision) {
         fprintf(stderr, "%d vision embeddings provided but %d placeholders are present in the prompt\n",
@@ -4311,7 +4850,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         char lptail[1024]; lptail[0] = 0;
         if (q->logprobs > 0)
             coli_logprob_tail(lptail, sizeof lptail, row, m->c.vocab, next, q->logprobs);
-        free(logits);
+        glm53_tracked_free(m, ARIVAN_MEM_WORKSPACE, logits);
         logits = NULL;
         if (is_stop(next)) break;
         sequence[total++] = next;
@@ -4324,7 +4863,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         logits = forward_span(m, session, &next, 1, NULL, 0);
         rows = 1;
     }
-    free(logits);
+    glm53_tracked_free(m, ARIVAN_MEM_WORKSPACE, logits);
     vision_embeddings_release(m, vision, n_vision);
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
@@ -4692,7 +5231,7 @@ int main(int argc, char **argv) {
         if (!has_tokenizer) printf("greedy");
         for (int step = 0; step < greedy; step++) {
             int next = argmax(logits + (size_t)(rows - 1) * model.c.vocab, model.c.vocab);
-            free(logits);
+            glm53_tracked_free(&model, ARIVAN_MEM_WORKSPACE, logits);
             logits = NULL;
             int done = 0;
             for (int i = 0; i < n_stops; i++) if (next == stops[i]) done = 1;
@@ -4731,7 +5270,7 @@ int main(int argc, char **argv) {
                (unsigned long long)g_metal_moe_fallback,
                (unsigned long long)g_metal_moe_rows);
 #endif
-    free(logits);
+    glm53_tracked_free(&model, ARIVAN_MEM_WORKSPACE, logits);
     session_close(&model, session);
     glm53_telemetry_save();
     vision_embeddings_release(&model, vision, n_vision);

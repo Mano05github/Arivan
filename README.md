@@ -17,8 +17,8 @@ interface, and a path toward low-memory model execution.
 
 > [!IMPORTANT]
 > The 8 GiB profile is currently an admission-control contract, not a claim
-> that GLM-5.3 Flash already runs within 8 GiB. The remaining engine milestone
-> is complete forward-workspace accounting and real-checkpoint certification.
+> that GLM-5.3 Flash already runs within 8 GiB. Text and vision admission are
+> implemented; real-checkpoint, real-hardware certification is still required.
 
 ## Current status
 
@@ -32,6 +32,8 @@ Version: `0.1.0.dev0`
 - Synchronous one-layer dense paging under native memory profiles
 - Row-windowed token embeddings and chunked output-head projection
 - Stage-paged GLM vision weights with profile-specific image-token limits
+- Adaptive prefill chunks with overflow-checked text-workspace admission
+- Preflight coverage for dense-layer, embedding, and output-head paging peaks
 - GLM-5.3 Flash load-peak measurement and expert-cache admission control
 - Zero-cache GLM-5.3 expert execution through bounded reusable staging slots
 - Opt-in phase telemetry with `ARIVAN_MEMORY_TELEMETRY=1`
@@ -43,8 +45,9 @@ Version: `0.1.0.dev0`
 Arivan currently refuses unsafe low-memory configurations instead of allowing
 the process to overcommit and fail later. The expert-cache floor has been
 removed, dense layer matrices use a synchronous bounded window, and global
-embedding/head tensors and vision stages are paged. General text-forward
-workspaces are the principal remaining 8 GiB blocker.
+embedding/head tensors and vision stages are paged. The ordinary CPU text
+forward is admitted before recurrent state changes and returned logits remain
+accounted until release. Full-size checkpoint certification remains pending.
 
 The native runtime currently includes adapters for GLM-5.3-Flash,
 GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6, Qwen3.8-Flash-Next,
@@ -125,7 +128,7 @@ delivery sequence, and GLM-5.3 Flash acceptance gates.
 The next development milestone is correct GLM-5.3 Flash text generation below
 the 8 GiB profile's 5.25 GiB engine ceiling:
 
-1. Account and bound every text-forward workspace.
+1. Certify the bounded text/vision path on a full GLM-5.3 Flash checkpoint.
 2. Add bounded asynchronous prefetch to the synchronous dense-layer window.
 3. Replace equal per-layer pinning with a global byte-budgeted cache.
 4. Restore int8 MTP depth one and enable it only when it improves net speed.

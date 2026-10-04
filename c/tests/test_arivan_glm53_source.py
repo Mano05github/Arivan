@@ -73,6 +73,17 @@ class ArivanGlm53SourceTest(unittest.TestCase):
     def test_profile_controls_the_default_prefill_chunk(self):
         self.assertIn("m->memory_profile.prefill_chunk", SOURCE)
         self.assertIn("GLM53_PREFILL_CHUNK must be an integer", SOURCE)
+        self.assertIn("forward_admission_bytes", SOURCE)
+        self.assertIn("event=prefill-chunk-reduced", SOURCE)
+
+    def test_profile_accounts_forward_workspace_and_returned_logits(self):
+        self.assertIn("forward_workspace_plan", SOURCE)
+        self.assertIn("forward_paging_peak", SOURCE)
+        self.assertIn("dense_layer_paging_peak", SOURCE)
+        self.assertIn("output_head_paging_peak", SOURCE)
+        self.assertIn("glm53_tracked_alloc", SOURCE)
+        self.assertIn("glm53_tracked_free", SOURCE)
+        self.assertIn("forward_workspace_peak_bytes", SOURCE)
 
     def test_every_glm53_link_path_includes_native_memory_module(self):
         self.assertIn("glm53: glm53$(EXE)", MAKEFILE)

@@ -62,9 +62,37 @@ embeddings are read by prompt row, and the output projection runs in bounded
 vocabulary blocks while preserving tied-weight semantics. Vision execution
 loads the patch projection, one transformer block, and one merger matrix at a
 time; each stage is released before the next, and activation buffers are
-admitted against the profile's image-token limit. The profile remains
-experimental until all text-forward workspaces use the native budget and a
-real checkpoint passes the hardware certification gates.
+admitted against the profile's image-token limit. The ordinary CPU text path
+preflights residual streams, attention/FFN scratch, returned logits, embedding
+rows, the largest dense-layer materialization peak, and the output-head window
+before it changes recurrent state. Returned logits stay charged until their
+caller releases them. The profile remains experimental until a real checkpoint
+passes the hardware certification gates.
+
+### Forward admission algorithm
+
+For a candidate chunk of `N` tokens, the native planner uses checked integer
+arithmetic to calculate:
+
+```text
+current accounted bytes
++ retained caller buffers (already present in current)
++ logits(N) + conservative CPU compute scratch(N)
++ max(embedding window(N), largest dense-layer load peak, head-window peak)
+```
+
+The three paging terms are mutually exclusive in the synchronous execution
+order, so taking their maximum is safe without charging all three at once. The
+fixed dense/head peaks are calculated once from tensor metadata and cached;
+the token-dependent term is recalculated per candidate.
+
+- Best case: the configured chunk fits and runs unchanged after one admission
+  check.
+- Typical case: if it does not fit, monotonic binary search selects the largest
+  fitting chunk in `O(log N)` checks; execution still visits each token once.
+- Worst case: arithmetic overflow, an invalid tensor layout, or failure to fit
+  even one token is rejected before the forward mutates KV/KDA state. Short,
+  trailing, and overflow-sized vision inputs are rejected before vision work.
 
 ## Delivery order
 

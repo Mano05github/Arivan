@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -107,6 +108,35 @@ def main() -> int:
         if profiled_lines.get(field) != lines.get(field):
             print(f"FAIL paging vision: output diverso per {field}")
             return 1
+
+    # Malformed patch payloads must be rejected before vision execution. A
+    # short file used to leave the tail uninitialized; a long one silently
+    # ignored bytes and could hide a caller/grid mismatch.
+    patch_bytes = (arguments.fixture / "patches.f32").read_bytes()
+    with tempfile.TemporaryDirectory(prefix="arivan-patches-") as temporary:
+        for label, payload in (("short", patch_bytes[:-4]),
+                               ("trailing", patch_bytes + b"\0")):
+            bad_patch = Path(temporary) / f"{label}.f32"
+            bad_patch.write_bytes(payload)
+            bad_command = command.copy()
+            bad_command[bad_command.index("--patches") + 1] = str(bad_patch)
+            rejected = subprocess.run(
+                bad_command, capture_output=True, text=True,
+                env={**os.environ, "GLM53_BITS": str(bits)})
+            if rejected.returncode == 0 or "expected" not in rejected.stderr:
+                print(f"FAIL paging vision: payload {label} non rifiutato")
+                return 1
+
+    overflow_command = command.copy()
+    overflow_command[overflow_command.index("--grid") + 1] = (
+        "2147483647x2147483647")
+    rejected = subprocess.run(
+        overflow_command, capture_output=True, text=True,
+        env={**os.environ, "GLM53_BITS": str(bits)})
+    if (rejected.returncode == 0 or
+            "invalid or overflowing vision layout" not in rejected.stderr):
+        print("FAIL paging vision: griglia overflow non rifiutata")
+        return 1
 
     telemetry = profiled.stderr
     for field in ("vision_window_peak_bytes", "vision_workspace_peak_bytes"):
