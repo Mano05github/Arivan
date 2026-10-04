@@ -52,6 +52,20 @@ typedef struct {
     const float *down_w, *down_b;        /* [hidden, intermediate] */
 } ColiVisionBlock;
 
+typedef enum {
+    COLI_VISION_STAGE_PATCH = 0,
+    COLI_VISION_STAGE_BLOCK,
+    COLI_VISION_STAGE_POST_NORM,
+    COLI_VISION_STAGE_DOWNSAMPLE,
+    COLI_VISION_STAGE_MERGER_PROJ,
+    COLI_VISION_STAGE_MERGER_GATE,
+    COLI_VISION_STAGE_MERGER_UP,
+    COLI_VISION_STAGE_MERGER_DOWN
+} ColiVisionStage;
+
+typedef void (*ColiVisionStageHook)(void *context, ColiVisionStage stage,
+                                    int layer);
+
 typedef struct {
     ColiVisionConfig config;
     const float *patch_w, *patch_b;      /* [hidden, in_channels*temporal*patch*patch] */
@@ -62,7 +76,21 @@ typedef struct {
     const float *merger_norm_w, *merger_norm_b;
     const float *merger_gate, *merger_up;/* [proj_intermediate, out_hidden] */
     const float *merger_down;            /* [out_hidden, proj_intermediate] */
+    void *stage_context;
+    ColiVisionStageHook stage_acquire, stage_release;
 } ColiVisionTower;
+
+static inline void coli_vision_stage_acquire(const ColiVisionTower *tower,
+                                              ColiVisionStage stage, int layer) {
+    if (tower->stage_acquire)
+        tower->stage_acquire(tower->stage_context, stage, layer);
+}
+
+static inline void coli_vision_stage_release(const ColiVisionTower *tower,
+                                              ColiVisionStage stage, int layer) {
+    if (tower->stage_release)
+        tower->stage_release(tower->stage_context, stage, layer);
+}
 
 static inline void coli_vision_matvec(float *out, const float *w, const float *b,
                                       const float *in, int rows, int columns) {
@@ -134,6 +162,7 @@ static inline int coli_vision_forward(float *out, const ColiVisionTower *tower,
         return -1;
 
     const int tokens = grid_h * grid_w;
+    const int blocks = coli_vision_output_tokens(c, grid_h, grid_w);
     const int hidden = c->hidden, heads = c->heads, hd = c->head_dim;
     const int patch_width = c->in_channels * c->temporal * c->patch * c->patch;
     const int rot = hd / 2;                   /* rotary width before duplication */
@@ -147,7 +176,14 @@ static inline int coli_vision_forward(float *out, const ColiVisionTower *tower,
     float *scratch = malloc((size_t)(hidden > c->intermediate ? hidden : c->intermediate) *
                             sizeof(float));
     float *branch = malloc((size_t)tokens * hidden * sizeof(float));
-    if (!state || !cos_table || !sin_table || !qkv || !scores || !scratch || !branch) {
+    float *block_gate = malloc((size_t)c->intermediate * 2 * sizeof(float));
+    float *merged = malloc((size_t)blocks * c->out_hidden * sizeof(float));
+    float *gated = malloc((size_t)blocks * c->proj_intermediate * sizeof(float));
+    float *up = malloc((size_t)c->proj_intermediate * sizeof(float));
+    float *merge_tmp = malloc((size_t)c->out_hidden * sizeof(float));
+    if (!state || !cos_table || !sin_table || !qkv || !scores || !scratch ||
+        !branch || !block_gate || !merged || !gated || !up || !merge_tmp) {
+        free(merge_tmp); free(up); free(gated); free(merged); free(block_gate);
         free(branch); free(scratch); free(scores); free(qkv);
         free(sin_table); free(cos_table); free(state);
         return -1;
@@ -155,9 +191,11 @@ static inline int coli_vision_forward(float *out, const ColiVisionTower *tower,
 
     /* Patch embedding: the checkpoint's Conv3d has kernel == stride, so it is a
      * matrix applied to each flattened patch, not a convolution. */
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_PATCH, -1);
     for (int t = 0; t < tokens; t++)
         coli_vision_matvec(state + (size_t)t * hidden, tower->patch_w, tower->patch_b,
                            pixels + (size_t)t * patch_width, hidden, patch_width);
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_PATCH, -1);
 
     /* 2-D rotary tables, in the same block-major order as the tokens. */
     {
@@ -184,6 +222,7 @@ static inline int coli_vision_forward(float *out, const ColiVisionTower *tower,
     }
 
     for (int layer = 0; layer < c->depth; layer++) {
+        coli_vision_stage_acquire(tower, COLI_VISION_STAGE_BLOCK, layer);
         const ColiVisionBlock *block = &tower->blocks[layer];
         /* ---- attention ---- */
         for (int t = 0; t < tokens; t++) {
@@ -247,42 +286,39 @@ static inline int coli_vision_forward(float *out, const ColiVisionTower *tower,
         }
         /* ---- MLP ---- */
         for (int t = 0; t < tokens; t++) {
-            float *gate = malloc((size_t)c->intermediate * 2 * sizeof(float));
-            if (!gate) { free(branch); free(scratch); free(scores); free(qkv);
-                         free(sin_table); free(cos_table); free(state); return -1; }
-            float *up = gate + c->intermediate;
+            float *gate = block_gate;
+            float *block_up = gate + c->intermediate;
             coli_vision_rmsnorm(scratch, state + (size_t)t * hidden, block->norm2, hidden, c->eps);
             coli_vision_matvec(gate, block->gate_w, block->gate_b, scratch, c->intermediate, hidden);
-            coli_vision_matvec(up, block->up_w, block->up_b, scratch, c->intermediate, hidden);
+            coli_vision_matvec(block_up, block->up_w, block->up_b, scratch,
+                               c->intermediate, hidden);
             for (int i = 0; i < c->intermediate; i++) {
                 float g = gate[i] > c->swiglu_limit ? c->swiglu_limit : gate[i];
-                float u = coli_vision_clamp(up[i], -c->swiglu_limit, c->swiglu_limit);
+                float u = coli_vision_clamp(block_up[i], -c->swiglu_limit,
+                                            c->swiglu_limit);
                 gate[i] = coli_vision_silu(g) * u;
             }
             coli_vision_matvec(scratch, block->down_w, block->down_b, gate, hidden, c->intermediate);
             for (int i = 0; i < hidden; i++) state[(size_t)t * hidden + i] += scratch[i];
-            free(gate);
         }
+        coli_vision_stage_release(tower, COLI_VISION_STAGE_BLOCK, layer);
     }
 
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_POST_NORM, -1);
     for (int t = 0; t < tokens; t++)
         coli_vision_rmsnorm(state + (size_t)t * hidden, state + (size_t)t * hidden,
                             tower->post_norm, hidden, c->eps);
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_POST_NORM, -1);
 
     /* Spatial merge. The reference views the tokens as [-1, m, m, hidden],
      * permutes to [N, hidden, m, m] and applies a Conv2d whose kernel covers
      * the whole block, so each output token is one dot product over the
      * block's m*m*hidden values - which only lines up because the tokens of a
      * block are adjacent (see the header comment). */
-    const int m = c->merge, blocks = coli_vision_output_tokens(c, grid_h, grid_w);
-    float *merged = malloc((size_t)c->out_hidden * sizeof(float));
-    float *gated = malloc((size_t)c->proj_intermediate * 2 * sizeof(float));
-    if (!merged || !gated) {
-        free(gated); free(merged); free(branch); free(scratch); free(scores);
-        free(qkv); free(sin_table); free(cos_table); free(state);
-        return -1;
-    }
+    const int m = c->merge;
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_DOWNSAMPLE, -1);
     for (int n = 0; n < blocks; n++) {
+        float *row = merged + (size_t)n * c->out_hidden;
         for (int o = 0; o < c->out_hidden; o++) {
             float sum = tower->down_b ? tower->down_b[o] : 0.0f;
             for (int ch = 0; ch < hidden; ch++)
@@ -292,28 +328,59 @@ static inline int coli_vision_forward(float *out, const ColiVisionTower *tower,
                         size_t token = (size_t)n * m * m + (size_t)kh * m + kw;
                         sum += tower->down_w[weight_index] * state[token * hidden + ch];
                     }
-            merged[o] = sum;
+            row[o] = sum;
         }
-        /* Patch merger: proj, LayerNorm, GELU, then a clamped SwiGLU. */
-        float *tmp = branch;                                  /* reuse: >= out_hidden */
-        coli_vision_matvec(tmp, tower->merger_proj, NULL, merged, c->out_hidden, c->out_hidden);
-        coli_vision_layernorm(merged, tmp, tower->merger_norm_w, tower->merger_norm_b,
-                              c->out_hidden, 1e-5f);
-        for (int i = 0; i < c->out_hidden; i++) merged[i] = coli_vision_gelu(merged[i]);
-        float *up = gated + c->proj_intermediate;
-        coli_vision_matvec(gated, tower->merger_gate, NULL, merged, c->proj_intermediate, c->out_hidden);
-        coli_vision_matvec(up, tower->merger_up, NULL, merged, c->proj_intermediate, c->out_hidden);
-        for (int i = 0; i < c->proj_intermediate; i++) {
-            float g = gated[i] > c->swiglu_limit ? c->swiglu_limit : gated[i];
-            float u = coli_vision_clamp(up[i], -c->swiglu_limit, c->swiglu_limit);
-            gated[i] = coli_vision_silu(g) * u;
-        }
-        coli_vision_matvec(out + (size_t)n * c->out_hidden, tower->merger_down, NULL,
-                           gated, c->out_hidden, c->proj_intermediate);
     }
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_DOWNSAMPLE, -1);
 
+    /* The merger matrices are deliberately separate stages. A profiled
+     * caller can page one matrix at a time; activations remain bounded by the
+     * configured number of image tokens. */
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_MERGER_PROJ, -1);
+    for (int n = 0; n < blocks; n++) {
+        float *row = merged + (size_t)n * c->out_hidden;
+        coli_vision_matvec(merge_tmp, tower->merger_proj, NULL, row,
+                           c->out_hidden, c->out_hidden);
+        coli_vision_layernorm(row, merge_tmp, tower->merger_norm_w,
+                              tower->merger_norm_b, c->out_hidden, 1e-5f);
+        for (int i = 0; i < c->out_hidden; i++) row[i] = coli_vision_gelu(row[i]);
+    }
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_MERGER_PROJ, -1);
+
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_MERGER_GATE, -1);
+    for (int n = 0; n < blocks; n++)
+        coli_vision_matvec(gated + (size_t)n * c->proj_intermediate,
+                           tower->merger_gate, NULL,
+                           merged + (size_t)n * c->out_hidden,
+                           c->proj_intermediate, c->out_hidden);
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_MERGER_GATE, -1);
+
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_MERGER_UP, -1);
+    for (int n = 0; n < blocks; n++) {
+        float *gate = gated + (size_t)n * c->proj_intermediate;
+        coli_vision_matvec(up, tower->merger_up, NULL,
+                           merged + (size_t)n * c->out_hidden,
+                           c->proj_intermediate, c->out_hidden);
+        for (int i = 0; i < c->proj_intermediate; i++) {
+            float g = gate[i] > c->swiglu_limit ? c->swiglu_limit : gate[i];
+            float u = coli_vision_clamp(up[i], -c->swiglu_limit, c->swiglu_limit);
+            gate[i] = coli_vision_silu(g) * u;
+        }
+    }
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_MERGER_UP, -1);
+
+    coli_vision_stage_acquire(tower, COLI_VISION_STAGE_MERGER_DOWN, -1);
+    for (int n = 0; n < blocks; n++)
+        coli_vision_matvec(out + (size_t)n * c->out_hidden, tower->merger_down, NULL,
+                           gated + (size_t)n * c->proj_intermediate,
+                           c->out_hidden, c->proj_intermediate);
+    coli_vision_stage_release(tower, COLI_VISION_STAGE_MERGER_DOWN, -1);
+
+    free(merge_tmp);
+    free(up);
     free(gated);
     free(merged);
+    free(block_gate);
     free(branch);
     free(scratch);
     free(scores);

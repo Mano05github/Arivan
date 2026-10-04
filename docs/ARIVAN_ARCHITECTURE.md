@@ -42,8 +42,9 @@ the control plane through a stable plan protocol.
 The native budget records accounted peaks separately for load, vision,
 prefill, and decode. Set `ARIVAN_MEMORY_TELEMETRY=1` to print transitions and
 the current, global-peak, phase-peak, limit, available byte counts, observed
-RSS peak, and the baseline, resident-weight, dense-window, vision, and
-workspace categories. Profile enforcement starts before the first model
+RSS peak, and the baseline, resident-weight, dense-window, vision-window,
+vision-state, and workspace categories. Exact byte counters accompany the
+human-readable MiB values. Profile enforcement starts before the first model
 allocation. Load-time quantization accounts its temporary f32 source together
 with the final resident representation, then transactionally reclassifies or
 releases the temporary bytes.
@@ -58,9 +59,12 @@ allocation ledger. Under a native profile, transformer matrices are described
 at startup and materialized synchronously into a single-layer `dense-window`
 allocation, which is released before advancing to the next layer. Token
 embeddings are read by prompt row, and the output projection runs in bounded
-vocabulary blocks while preserving tied-weight semantics. The profile remains
-experimental until vision weights become phase-scoped and all forward
-workspaces use the native budget.
+vocabulary blocks while preserving tied-weight semantics. Vision execution
+loads the patch projection, one transformer block, and one merger matrix at a
+time; each stage is released before the next, and activation buffers are
+admitted against the profile's image-token limit. The profile remains
+experimental until all text-forward workspaces use the native budget and a
+real checkpoint passes the hardware certification gates.
 
 ## Delivery order
 

@@ -18,6 +18,7 @@ typedef enum ArivanMemoryKind {
     ARIVAN_MEM_EXPERT_PINNED,
     ARIVAN_MEM_EXPERT_LRU,
     ARIVAN_MEM_KV_STATE,
+    ARIVAN_MEM_VISION_WINDOW,
     ARIVAN_MEM_VISION,
     ARIVAN_MEM_MTP,
     ARIVAN_MEM_WORKSPACE,
@@ -63,6 +64,8 @@ typedef struct ArivanExpertPlan {
     uint64_t staging_bytes;
 } ArivanExpertPlan;
 
+int arivan_memory_checked_add(uint64_t left, uint64_t right, uint64_t *out);
+int arivan_memory_checked_mul(uint64_t left, uint64_t right, uint64_t *out);
 int arivan_memory_profile(const char *name, ArivanMemoryProfile *out);
 void arivan_memory_budget_init(ArivanMemoryBudget *budget, uint64_t limit_bytes);
 void arivan_memory_budget_set_phase(ArivanMemoryBudget *budget, ArivanMemoryPhase phase);

@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define MIB ((uint64_t)1024 * 1024)
 
@@ -74,6 +75,18 @@ static void test_phase_and_names(void) {
     assert(budget.peak_by_phase[ARIVAN_PHASE_DECODE] == 100);
     assert(arivan_memory_phase_name(budget.phase)[0] == 'd');
     assert(arivan_memory_kind_name(ARIVAN_MEM_MTP)[0] == 'm');
+    assert(strcmp(arivan_memory_kind_name(ARIVAN_MEM_VISION_WINDOW),
+                  "vision-window") == 0);
+}
+
+static void test_checked_sizes(void) {
+    uint64_t value = 0;
+    assert(arivan_memory_checked_add(40, 2, &value) == 0 && value == 42);
+    assert(arivan_memory_checked_mul(6, 7, &value) == 0 && value == 42);
+    assert(arivan_memory_checked_add(UINT64_MAX, 1, &value) != 0);
+    assert(arivan_memory_checked_mul(UINT64_MAX, 2, &value) != 0);
+    assert(arivan_memory_checked_add(1, 2, NULL) != 0);
+    assert(arivan_memory_checked_mul(1, 2, NULL) != 0);
 }
 
 static void test_uniform_cache_clamps_and_reserves(void) {
@@ -148,6 +161,7 @@ int main(void) {
     test_release_and_peak();
     test_reclassify_preserves_total_and_is_transactional();
     test_phase_and_names();
+    test_checked_sizes();
     test_uniform_cache_clamps_and_reserves();
     test_uniform_cache_refusal_is_transactional();
     test_expert_plan_prefers_per_layer_cache();

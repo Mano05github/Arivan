@@ -28,6 +28,7 @@ modello vero, dove le righe sono lunghe 4096 e i pesi vogliono dire qualcosa.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -64,13 +65,19 @@ def main() -> int:
     expected_greedy = reference["greedy"]
     comparable = reference.get("greedy_exact_steps", len(expected_greedy))
 
+    command = [arguments.binary, "--model", str(arguments.fixture), "--ids", prompt,
+               "--patches", str(arguments.fixture / "patches.f32"),
+               "--grid", f"{grid_h}x{grid_w}",
+               "--greedy", str(len(expected_greedy)), "--logits"]
     result = subprocess.run(
-        [arguments.binary, "--model", str(arguments.fixture), "--ids", prompt,
-         "--patches", str(arguments.fixture / "patches.f32"),
-         "--grid", f"{grid_h}x{grid_w}",
-         "--greedy", str(len(expected_greedy)), "--logits"],
+        command,
         capture_output=True, text=True, check=True,
         env={**os.environ, "GLM53_BITS": str(bits)})
+
+    profiled = subprocess.run(
+        command, capture_output=True, text=True, check=True,
+        env={**os.environ, "GLM53_BITS": str(bits),
+             "ARIVAN_MEMORY_PROFILE": "8gb", "ARIVAN_MEMORY_TELEMETRY": "1"})
 
     lines = {line.split()[0]: line.split()[1:]
              for line in result.stdout.splitlines() if line.strip()}
@@ -78,6 +85,8 @@ def main() -> int:
     forcing = [int(value) for value in lines["teacher_forcing"]]
     greedy = [int(value) for value in lines["greedy"]]
     logits = [float(value) for value in lines["last_logits"]]
+    profiled_lines = {line.split()[0]: line.split()[1:]
+                      for line in profiled.stdout.splitlines() if line.strip()}
 
     if tokens != reference["image_tokens"]:
         print(f"FAIL token immagine: {tokens}, attesi {reference['image_tokens']}")
@@ -93,6 +102,27 @@ def main() -> int:
     worst = max(abs(a - b) for a, b in zip(logits, reference["last_logits"], strict=True))
     if worst > arguments.logit_tolerance:
         print(f"FAIL logit: max abs {worst:.3g} oltre {arguments.logit_tolerance:.3g}")
+        return 1
+    for field in ("vision_tokens", "teacher_forcing", "greedy", "last_logits"):
+        if profiled_lines.get(field) != lines.get(field):
+            print(f"FAIL paging vision: output diverso per {field}")
+            return 1
+
+    telemetry = profiled.stderr
+    for field in ("vision_window_peak_bytes", "vision_workspace_peak_bytes"):
+        values = [int(value) for value in re.findall(rf"{field}=([0-9]+)", telemetry)]
+        if not values or max(values) <= 0:
+            print(f"FAIL paging vision: telemetria senza {field}")
+            return 1
+    completed = [line for line in telemetry.splitlines()
+                 if "event=vision-complete" in line]
+    if not completed or "vision_window_bytes=0" not in completed[-1]:
+        print("FAIL paging vision: pesi ancora residenti dopo la torre")
+        return 1
+    released = [line for line in telemetry.splitlines()
+                if "event=vision-released" in line]
+    if not released or "vision_bytes=0" not in released[-1]:
+        print("FAIL paging vision: embedding non rilasciati dopo il prefill")
         return 1
 
     skipped = ("" if comparable == len(expected_greedy) else

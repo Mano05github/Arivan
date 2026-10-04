@@ -167,8 +167,8 @@ const char *arivan_memory_kind_name(ArivanMemoryKind kind) {
     static const char *const names[ARIVAN_MEM_KIND_COUNT] = {
         "permanent", "resident-weights", "embedding-window",
         "output-head-window", "dense-window", "expert-staging",
-        "expert-pinned", "expert-lru", "kv-state", "vision", "mtp",
-        "workspace", "server"
+        "expert-pinned", "expert-lru", "kv-state", "vision-window",
+        "vision", "mtp", "workspace", "server"
     };
     if (kind < 0 || kind >= ARIVAN_MEM_KIND_COUNT) return "invalid";
     return names[kind];
@@ -178,4 +178,16 @@ const char *arivan_memory_phase_name(ArivanMemoryPhase phase) {
     static const char *const names[] = {"load", "vision", "prefill", "decode"};
     if (phase < ARIVAN_PHASE_LOAD || phase >= ARIVAN_PHASE_COUNT) return "invalid";
     return names[phase];
+}
+
+int arivan_memory_checked_add(uint64_t left, uint64_t right, uint64_t *out) {
+    if (!out || left > UINT64_MAX - right) return -1;
+    *out = left + right;
+    return 0;
+}
+
+int arivan_memory_checked_mul(uint64_t left, uint64_t right, uint64_t *out) {
+    if (!out || (right != 0 && left > UINT64_MAX / right)) return -1;
+    *out = left * right;
+    return 0;
 }

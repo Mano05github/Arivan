@@ -65,6 +65,8 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <errno.h>
 
 #include "cli_args.h"
 #include "json.h"
@@ -653,6 +655,25 @@ typedef struct {
 } Mat;
 
 typedef struct {
+    st_tensor *source;
+    float *data;
+    uint64_t bytes;
+} VisionWeight;
+
+enum {
+    VG_PATCH_W = 0, VG_PATCH_B, VG_POST_NORM, VG_DOWNSAMPLE_W,
+    VG_DOWNSAMPLE_B, VG_MERGER_PROJ, VG_MERGER_NORM_W,
+    VG_MERGER_NORM_B, VG_MERGER_GATE, VG_MERGER_UP, VG_MERGER_DOWN,
+    VG_COUNT
+};
+
+enum {
+    VB_NORM1 = 0, VB_NORM2, VB_QKV_W, VB_QKV_B, VB_Q_NORM, VB_K_NORM,
+    VB_PROJ_W, VB_PROJ_B, VB_GATE_W, VB_GATE_B, VB_UP_W, VB_UP_B,
+    VB_DOWN_W, VB_DOWN_B, VB_COUNT
+};
+
+typedef struct {
     /* comune */
     const float *in_ln, *post_ln;
     const float *hc_attn_fn, *hc_attn_base, *hc_attn_scale;
@@ -730,6 +751,8 @@ typedef struct {
     int dense_window_peak_layer;
     uint64_t embedding_window_peak;
     uint64_t output_head_window_peak;
+    uint64_t vision_window_peak;
+    uint64_t vision_workspace_peak;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -738,8 +761,11 @@ typedef struct {
     uint8_t **ehit;                       /* [layer][expert] toccato in questo turno */
     /* torre vision: presente solo se il checkpoint la porta */
     int has_vision;
+    int vision_paging;
     ColiVisionTower vision;
     ColiVisionBlock *vblocks;
+    VisionWeight vision_global[VG_COUNT];
+    VisionWeight *vision_block_weights;
 } GModel;
 
 static void glm53_memory_reserve_or_die(GModel *m, ArivanMemoryKind kind,
@@ -1531,12 +1557,16 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             "[ARIVAN MEMORY] event=%s phase=%s current=%.2fMiB peak=%.2fMiB "
             "phase_peak=%.2fMiB limit=%.2fMiB available=%.2fMiB "
             "baseline=%.2fMiB weights=%.2fMiB embedding_window=%.2fMiB "
-            "head_window=%.2fMiB dense_window=%.2fMiB vision=%.2fMiB "
+            "head_window=%.2fMiB dense_window=%.2fMiB "
+            "vision_window=%.2fMiB vision=%.2fMiB "
             "workspace=%.2fMiB embedding_window_peak=%.2fMiB "
             "head_window_peak=%.2fMiB dense_window_peak=%.2fMiB "
+            "vision_window_peak=%.2fMiB vision_workspace_peak=%.2fMiB "
             "embedding_window_bytes=%llu head_window_bytes=%llu "
             "dense_window_bytes=%llu embedding_window_peak_bytes=%llu "
             "head_window_peak_bytes=%llu dense_window_peak_bytes=%llu "
+            "vision_window_bytes=%llu vision_bytes=%llu "
+            "vision_window_peak_bytes=%llu vision_workspace_peak_bytes=%llu "
             "dense_window_layer=%d rss_peak=%.2fMiB\n",
             event, arivan_memory_phase_name(b->phase),
             b->current_bytes / 1048576.0, b->peak_bytes / 1048576.0,
@@ -1548,17 +1578,24 @@ static void glm53_memory_report(const GModel *m, const char *event) {
             b->by_kind[ARIVAN_MEM_EMBEDDING_WINDOW] / 1048576.0,
             b->by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW] / 1048576.0,
             b->by_kind[ARIVAN_MEM_DENSE_WINDOW] / 1048576.0,
+            b->by_kind[ARIVAN_MEM_VISION_WINDOW] / 1048576.0,
             b->by_kind[ARIVAN_MEM_VISION] / 1048576.0,
             b->by_kind[ARIVAN_MEM_WORKSPACE] / 1048576.0,
             m->embedding_window_peak / 1048576.0,
             m->output_head_window_peak / 1048576.0,
             m->dense_window_peak / 1048576.0,
+            m->vision_window_peak / 1048576.0,
+            m->vision_workspace_peak / 1048576.0,
             (unsigned long long)b->by_kind[ARIVAN_MEM_EMBEDDING_WINDOW],
             (unsigned long long)b->by_kind[ARIVAN_MEM_OUTPUT_HEAD_WINDOW],
             (unsigned long long)b->by_kind[ARIVAN_MEM_DENSE_WINDOW],
             (unsigned long long)m->embedding_window_peak,
             (unsigned long long)m->output_head_window_peak,
             (unsigned long long)m->dense_window_peak,
+            (unsigned long long)b->by_kind[ARIVAN_MEM_VISION_WINDOW],
+            (unsigned long long)b->by_kind[ARIVAN_MEM_VISION],
+            (unsigned long long)m->vision_window_peak,
+            (unsigned long long)m->vision_workspace_peak,
             m->dense_window_peak_layer,
             compat_peak_rss_bytes() / 1048576.0);
 }
@@ -2672,9 +2709,203 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
 }
 
 /* ---------- vision ----------
- * La torre e' in vision_tower.h e non sa nulla di GLM: qui si riempiono solo i
- * puntatori ai pesi e si traduce la config. Il checkpoint solo-testo non porta
- * `model.visual.*` e allora has_vision resta 0: l'engine funziona identico. */
+ * Under a memory profile the tensor index remains resident but vision values
+ * do not. The shared tower asks for one execution stage at a time, so the
+ * largest live weight set is one transformer block or one merger matrix. */
+static void vision_weight_describe(GModel *m, VisionWeight *weight,
+                                   const char *fmt, ...) {
+    char name[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(name, sizeof(name), fmt, args);
+    va_end(args);
+    weight->source = st_find(&m->S, name);
+    if (!weight->source) {
+        fprintf(stderr, "missing vision tensor %s\n", name);
+        exit(1);
+    }
+    if (weight->source->numel < 0 || weight->source->nbytes < 0 ||
+        (uint64_t)weight->source->numel > UINT64_MAX / sizeof(float)) {
+        fprintf(stderr, "%s: invalid vision tensor size\n", name);
+        exit(1);
+    }
+    weight->bytes = (uint64_t)weight->source->numel * sizeof(float);
+    if (!m->vision_paging)
+        weight->data = (float *)load_f32(m, "%s", name);
+}
+
+/* A stage reserves its complete f32 window before reading its first tensor.
+ * This makes admission all-or-nothing: a later tensor cannot leave half of a
+ * block materialized merely because the remaining bytes do not fit. */
+static int vision_weight_materialize_reserved(VisionWeight *weight) {
+    weight->data = malloc((size_t)weight->bytes);
+    return weight->data ? 0 : -1;
+}
+
+static void vision_weight_drop(GModel *m, VisionWeight *weight) {
+    if (!weight || !weight->data) return;
+    free(weight->data);
+    weight->data = NULL;
+    glm53_memory_release_bytes(m, m->vision_paging ? ARIVAN_MEM_VISION_WINDOW
+                                                   : ARIVAN_MEM_VISION,
+                               weight->bytes);
+}
+
+static void vision_bind_global(GModel *m) {
+    m->vision.patch_w = m->vision_global[VG_PATCH_W].data;
+    m->vision.patch_b = m->vision_global[VG_PATCH_B].data;
+    m->vision.post_norm = m->vision_global[VG_POST_NORM].data;
+    m->vision.down_w = m->vision_global[VG_DOWNSAMPLE_W].data;
+    m->vision.down_b = m->vision_global[VG_DOWNSAMPLE_B].data;
+    m->vision.merger_proj = m->vision_global[VG_MERGER_PROJ].data;
+    m->vision.merger_norm_w = m->vision_global[VG_MERGER_NORM_W].data;
+    m->vision.merger_norm_b = m->vision_global[VG_MERGER_NORM_B].data;
+    m->vision.merger_gate = m->vision_global[VG_MERGER_GATE].data;
+    m->vision.merger_up = m->vision_global[VG_MERGER_UP].data;
+    m->vision.merger_down = m->vision_global[VG_MERGER_DOWN].data;
+}
+
+static void vision_bind_block(GModel *m, int layer) {
+    VisionWeight *w = m->vision_block_weights + (size_t)layer * VB_COUNT;
+    ColiVisionBlock *b = &m->vblocks[layer];
+    b->norm1 = w[VB_NORM1].data; b->norm2 = w[VB_NORM2].data;
+    b->qkv_w = w[VB_QKV_W].data; b->qkv_b = w[VB_QKV_B].data;
+    b->q_norm = w[VB_Q_NORM].data; b->k_norm = w[VB_K_NORM].data;
+    b->proj_w = w[VB_PROJ_W].data; b->proj_b = w[VB_PROJ_B].data;
+    b->gate_w = w[VB_GATE_W].data; b->gate_b = w[VB_GATE_B].data;
+    b->up_w = w[VB_UP_W].data; b->up_b = w[VB_UP_B].data;
+    b->down_w = w[VB_DOWN_W].data; b->down_b = w[VB_DOWN_B].data;
+}
+
+static int vision_stage_weights(GModel *m, ColiVisionStage stage, int layer,
+                                VisionWeight **out) {
+    VisionWeight *g = m->vision_global;
+    switch (stage) {
+        case COLI_VISION_STAGE_PATCH:
+            out[0] = &g[VG_PATCH_W]; out[1] = &g[VG_PATCH_B]; return 2;
+        case COLI_VISION_STAGE_BLOCK: {
+            if (layer < 0 || layer >= m->c.vis_layers) return -1;
+            VisionWeight *w = m->vision_block_weights + (size_t)layer * VB_COUNT;
+            for (int i = 0; i < VB_COUNT; i++) out[i] = &w[i];
+            return VB_COUNT;
+        }
+        case COLI_VISION_STAGE_POST_NORM:
+            out[0] = &g[VG_POST_NORM]; return 1;
+        case COLI_VISION_STAGE_DOWNSAMPLE:
+            out[0] = &g[VG_DOWNSAMPLE_W]; out[1] = &g[VG_DOWNSAMPLE_B]; return 2;
+        case COLI_VISION_STAGE_MERGER_PROJ:
+            out[0] = &g[VG_MERGER_PROJ];
+            out[1] = &g[VG_MERGER_NORM_W];
+            out[2] = &g[VG_MERGER_NORM_B];
+            return 3;
+        case COLI_VISION_STAGE_MERGER_GATE:
+            out[0] = &g[VG_MERGER_GATE]; return 1;
+        case COLI_VISION_STAGE_MERGER_UP:
+            out[0] = &g[VG_MERGER_UP]; return 1;
+        case COLI_VISION_STAGE_MERGER_DOWN:
+            out[0] = &g[VG_MERGER_DOWN]; return 1;
+    }
+    return -1;
+}
+
+static void vision_stage_acquire(void *context, ColiVisionStage stage, int layer) {
+    GModel *m = context;
+    VisionWeight *weights[VB_COUNT];
+    const int count = vision_stage_weights(m, stage, layer, weights);
+    if (m->memory_budget.by_kind[ARIVAN_MEM_VISION_WINDOW] != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] vision window invariant failed before stage %d\n",
+                (int)stage);
+        exit(1);
+    }
+    if (count < 1) {
+        fprintf(stderr, "invalid vision stage %d layer %d\n", (int)stage, layer);
+        exit(1);
+    }
+
+    uint64_t window_bytes = 0, conversion_bytes = 0;
+    for (int i = 0; i < count; i++) {
+        VisionWeight *weight = weights[i];
+        uint64_t next = 0;
+        if (!weight->source || weight->data ||
+            arivan_memory_checked_add(window_bytes, weight->bytes, &next) != 0) {
+            fprintf(stderr, "invalid or overflowing vision stage %d\n", (int)stage);
+            exit(1);
+        }
+        window_bytes = next;
+        if ((uint64_t)weight->source->nbytes > conversion_bytes)
+            conversion_bytes = (uint64_t)weight->source->nbytes;
+    }
+    uint64_t stage_bytes = 0;
+    if (arivan_memory_checked_add(window_bytes, conversion_bytes,
+                                  &stage_bytes) != 0 ||
+        stage_bytes > arivan_memory_available(&m->memory_budget)) {
+        fprintf(stderr,
+                "[ARIVAN MEMORY] %s profile cannot reserve %.2f MiB weights plus "
+                "%.2f MiB conversion scratch for vision stage %d\n",
+                m->memory_profile.name, window_bytes / 1048576.0,
+                conversion_bytes / 1048576.0, (int)stage);
+        exit(1);
+    }
+    if (arivan_memory_reserve(&m->memory_budget, ARIVAN_MEM_VISION_WINDOW,
+                              window_bytes) != 0 ||
+        arivan_memory_reserve(&m->memory_budget, ARIVAN_MEM_WORKSPACE,
+                              conversion_bytes) != 0) {
+        if (m->memory_budget.by_kind[ARIVAN_MEM_VISION_WINDOW] >= window_bytes)
+            arivan_memory_release(&m->memory_budget, ARIVAN_MEM_VISION_WINDOW,
+                                  window_bytes);
+        fprintf(stderr, "[ARIVAN MEMORY] internal vision stage reservation failure\n");
+        exit(1);
+    }
+
+    const uint64_t live_window =
+        m->memory_budget.by_kind[ARIVAN_MEM_VISION_WINDOW];
+    const uint64_t live_workspace =
+        m->memory_budget.by_kind[ARIVAN_MEM_WORKSPACE];
+    if (live_window > m->vision_window_peak)
+        m->vision_window_peak = live_window;
+    if (live_workspace > m->vision_workspace_peak)
+        m->vision_workspace_peak = live_workspace;
+
+    for (int i = 0; i < count; i++) {
+        if (vision_weight_materialize_reserved(weights[i]) != 0) {
+            for (int loaded = 0; loaded < i; loaded++) {
+                free(weights[loaded]->data);
+                weights[loaded]->data = NULL;
+            }
+            glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE,
+                                       conversion_bytes);
+            glm53_memory_release_bytes(m, ARIVAN_MEM_VISION_WINDOW,
+                                       window_bytes);
+            fprintf(stderr, "OOM paging vision tensor %s\n",
+                    weights[i]->source->name);
+            exit(1);
+        }
+        st_read_f32_cap(&m->S, weights[i]->source->name, weights[i]->data,
+                        weights[i]->source->numel, 1);
+    }
+    glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, conversion_bytes);
+    if (stage == COLI_VISION_STAGE_BLOCK) vision_bind_block(m, layer);
+    vision_bind_global(m);
+}
+
+static void vision_stage_release(void *context, ColiVisionStage stage, int layer) {
+    GModel *m = context;
+    VisionWeight *weights[VB_COUNT];
+    const int count = vision_stage_weights(m, stage, layer, weights);
+    if (count < 1) {
+        fprintf(stderr, "invalid vision stage %d layer %d\n", (int)stage, layer);
+        exit(1);
+    }
+    for (int i = 0; i < count; i++) vision_weight_drop(m, weights[i]);
+    if (stage == COLI_VISION_STAGE_BLOCK) vision_bind_block(m, layer);
+    vision_bind_global(m);
+    if (m->memory_budget.by_kind[ARIVAN_MEM_VISION_WINDOW] != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] vision window invariant failed after stage %d\n",
+                (int)stage);
+        exit(1);
+    }
+}
+
 static void vision_load(GModel *m) {
     const Cfg *c = &m->c;
     m->has_vision = 0;
@@ -2682,6 +2913,7 @@ static void vision_load(GModel *m) {
     if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) return;
     const char *V = "model.visual.";
     const ArivanMemoryKind previous_kind = m->load_kind;
+    m->vision_paging = m->memory_active;
     m->load_kind = ARIVAN_MEM_VISION;
 
     m->vision.config = (ColiVisionConfig){
@@ -2693,38 +2925,61 @@ static void vision_load(GModel *m) {
         .eps = c->vis_eps, .swiglu_limit = c->vis_swiglu_limit,
         .rope_theta = 10000.0f,
     };
-    m->vision.patch_w = load_f32(m, "%spatch_embed.proj.weight", V);
-    m->vision.patch_b = load_f32(m, "%spatch_embed.proj.bias", V);
-    m->vision.post_norm = load_f32(m, "%spost_layernorm.weight", V);
-    m->vision.down_w = load_f32(m, "%sdownsample.weight", V);
-    m->vision.down_b = load_f32(m, "%sdownsample.bias", V);
-    m->vision.merger_proj = load_f32(m, "%smerger.proj.weight", V);
-    m->vision.merger_norm_w = load_f32(m, "%smerger.post_projection_norm.weight", V);
-    m->vision.merger_norm_b = load_f32(m, "%smerger.post_projection_norm.bias", V);
-    m->vision.merger_gate = load_f32(m, "%smerger.gate_proj.weight", V);
-    m->vision.merger_up = load_f32(m, "%smerger.up_proj.weight", V);
-    m->vision.merger_down = load_f32(m, "%smerger.down_proj.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_PATCH_W],
+                           "%spatch_embed.proj.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_PATCH_B],
+                           "%spatch_embed.proj.bias", V);
+    vision_weight_describe(m, &m->vision_global[VG_POST_NORM],
+                           "%spost_layernorm.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_DOWNSAMPLE_W],
+                           "%sdownsample.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_DOWNSAMPLE_B],
+                           "%sdownsample.bias", V);
+    vision_weight_describe(m, &m->vision_global[VG_MERGER_PROJ],
+                           "%smerger.proj.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_MERGER_NORM_W],
+                           "%smerger.post_projection_norm.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_MERGER_NORM_B],
+                           "%smerger.post_projection_norm.bias", V);
+    vision_weight_describe(m, &m->vision_global[VG_MERGER_GATE],
+                           "%smerger.gate_proj.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_MERGER_UP],
+                           "%smerger.up_proj.weight", V);
+    vision_weight_describe(m, &m->vision_global[VG_MERGER_DOWN],
+                           "%smerger.down_proj.weight", V);
 
     m->vblocks = calloc((size_t)c->vis_layers, sizeof(*m->vblocks));
-    if (!m->vblocks) { fprintf(stderr, "OOM allocating vision blocks\n"); exit(1); }
-    for (int b = 0; b < c->vis_layers; b++) {
-        ColiVisionBlock *vb = &m->vblocks[b];
-        vb->norm1 = load_f32(m, "%sblocks.%d.norm1.weight", V, b);
-        vb->norm2 = load_f32(m, "%sblocks.%d.norm2.weight", V, b);
-        vb->qkv_w = load_f32(m, "%sblocks.%d.attn.qkv.weight", V, b);
-        vb->qkv_b = load_f32(m, "%sblocks.%d.attn.qkv.bias", V, b);
-        vb->q_norm = load_f32(m, "%sblocks.%d.attn.q_norm.weight", V, b);
-        vb->k_norm = load_f32(m, "%sblocks.%d.attn.k_norm.weight", V, b);
-        vb->proj_w = load_f32(m, "%sblocks.%d.attn.proj.weight", V, b);
-        vb->proj_b = load_f32(m, "%sblocks.%d.attn.proj.bias", V, b);
-        vb->gate_w = load_f32(m, "%sblocks.%d.mlp.gate_proj.weight", V, b);
-        vb->gate_b = load_f32(m, "%sblocks.%d.mlp.gate_proj.bias", V, b);
-        vb->up_w = load_f32(m, "%sblocks.%d.mlp.up_proj.weight", V, b);
-        vb->up_b = load_f32(m, "%sblocks.%d.mlp.up_proj.bias", V, b);
-        vb->down_w = load_f32(m, "%sblocks.%d.mlp.down_proj.weight", V, b);
-        vb->down_b = load_f32(m, "%sblocks.%d.mlp.down_proj.bias", V, b);
+    m->vision_block_weights = calloc((size_t)c->vis_layers * VB_COUNT,
+                                      sizeof(*m->vision_block_weights));
+    if (!m->vblocks || !m->vision_block_weights) {
+        fprintf(stderr, "OOM allocating vision descriptors\n");
+        exit(1);
     }
+    for (int b = 0; b < c->vis_layers; b++) {
+        VisionWeight *w = m->vision_block_weights + (size_t)b * VB_COUNT;
+        vision_weight_describe(m, &w[VB_NORM1], "%sblocks.%d.norm1.weight", V, b);
+        vision_weight_describe(m, &w[VB_NORM2], "%sblocks.%d.norm2.weight", V, b);
+        vision_weight_describe(m, &w[VB_QKV_W], "%sblocks.%d.attn.qkv.weight", V, b);
+        vision_weight_describe(m, &w[VB_QKV_B], "%sblocks.%d.attn.qkv.bias", V, b);
+        vision_weight_describe(m, &w[VB_Q_NORM], "%sblocks.%d.attn.q_norm.weight", V, b);
+        vision_weight_describe(m, &w[VB_K_NORM], "%sblocks.%d.attn.k_norm.weight", V, b);
+        vision_weight_describe(m, &w[VB_PROJ_W], "%sblocks.%d.attn.proj.weight", V, b);
+        vision_weight_describe(m, &w[VB_PROJ_B], "%sblocks.%d.attn.proj.bias", V, b);
+        vision_weight_describe(m, &w[VB_GATE_W], "%sblocks.%d.mlp.gate_proj.weight", V, b);
+        vision_weight_describe(m, &w[VB_GATE_B], "%sblocks.%d.mlp.gate_proj.bias", V, b);
+        vision_weight_describe(m, &w[VB_UP_W], "%sblocks.%d.mlp.up_proj.weight", V, b);
+        vision_weight_describe(m, &w[VB_UP_B], "%sblocks.%d.mlp.up_proj.bias", V, b);
+        vision_weight_describe(m, &w[VB_DOWN_W], "%sblocks.%d.mlp.down_proj.weight", V, b);
+        vision_weight_describe(m, &w[VB_DOWN_B], "%sblocks.%d.mlp.down_proj.bias", V, b);
+        vision_bind_block(m, b);
+    }
+    vision_bind_global(m);
     m->vision.blocks = m->vblocks;
+    if (m->vision_paging) {
+        m->vision.stage_context = m;
+        m->vision.stage_acquire = vision_stage_acquire;
+        m->vision.stage_release = vision_stage_release;
+    }
     m->has_vision = 1;
     m->load_kind = previous_kind;
 }
@@ -2735,25 +2990,134 @@ static void vision_load(GModel *m) {
  * cui il processore li produce; la torre restituisce
  * grid_h/merge * grid_w/merge righe da out_hidden. Il chiamante possiede il
  * buffer restituito. */
-static float *vision_encode(GModel *m, const float *patches,
+typedef struct {
+    int patch_tokens;
+    int output_tokens;
+    uint64_t input_bytes;
+    uint64_t output_bytes;
+    uint64_t workspace_bytes;
+} VisionLayout;
+
+static int vision_layout(const ColiVisionConfig *c, int grid_h, int grid_w,
+                         VisionLayout *layout) {
+    uint64_t patch_tokens, output_tokens, patch_width, value;
+    uint64_t workspace_floats = 0;
+    if (!c || !layout || grid_h < 1 || grid_w < 1 || c->merge < 1 ||
+        c->in_channels < 1 || c->temporal < 1 || c->patch < 1 ||
+        c->hidden < 1 || c->head_dim < 1 || c->intermediate < 1 ||
+        c->out_hidden < 1 || c->proj_intermediate < 1 ||
+        grid_h % c->merge || grid_w % c->merge)
+        return -1;
+    if (arivan_memory_checked_mul((uint64_t)grid_h, (uint64_t)grid_w,
+                                  &patch_tokens) != 0 ||
+        arivan_memory_checked_mul((uint64_t)(grid_h / c->merge),
+                                  (uint64_t)(grid_w / c->merge),
+                                  &output_tokens) != 0 ||
+        patch_tokens > INT_MAX || output_tokens < 1 || output_tokens > INT_MAX)
+        return -1;
+
+    if (arivan_memory_checked_mul((uint64_t)c->in_channels,
+                                  (uint64_t)c->temporal, &patch_width) != 0 ||
+        arivan_memory_checked_mul(patch_width, (uint64_t)c->patch,
+                                  &patch_width) != 0 ||
+        arivan_memory_checked_mul(patch_width, (uint64_t)c->patch,
+                                  &patch_width) != 0 ||
+        arivan_memory_checked_mul(patch_tokens, patch_width, &value) != 0 ||
+        arivan_memory_checked_mul(value, sizeof(float), &layout->input_bytes) != 0 ||
+        arivan_memory_checked_mul(output_tokens, (uint64_t)c->out_hidden,
+                                  &value) != 0 ||
+        arivan_memory_checked_mul(value, sizeof(float), &layout->output_bytes) != 0)
+        return -1;
+
+#define VISION_ADD_PRODUCT(left, right) do {                                  \
+        if (arivan_memory_checked_mul((uint64_t)(left), (uint64_t)(right),     \
+                                      &value) != 0 ||                           \
+            arivan_memory_checked_add(workspace_floats, value,                \
+                                      &workspace_floats) != 0) return -1;       \
+    } while (0)
+    VISION_ADD_PRODUCT(patch_tokens, c->hidden);             /* state */
+    VISION_ADD_PRODUCT(patch_tokens, (uint64_t)c->head_dim * 2); /* rotary */
+    VISION_ADD_PRODUCT(patch_tokens, (uint64_t)c->hidden * 3);   /* qkv */
+    if (arivan_memory_checked_add(workspace_floats, patch_tokens,
+                                  &workspace_floats) != 0) return -1; /* scores */
+    if (arivan_memory_checked_add(workspace_floats,
+            (uint64_t)(c->hidden > c->intermediate ? c->hidden : c->intermediate),
+            &workspace_floats) != 0) return -1;              /* scratch */
+    VISION_ADD_PRODUCT(patch_tokens, c->hidden);              /* branch */
+    VISION_ADD_PRODUCT(c->intermediate, 2);                   /* block MLP */
+    VISION_ADD_PRODUCT(output_tokens, c->out_hidden);         /* merged */
+    VISION_ADD_PRODUCT(output_tokens, c->proj_intermediate);  /* gate */
+    if (arivan_memory_checked_add(workspace_floats,
+                                  (uint64_t)c->proj_intermediate,
+                                  &workspace_floats) != 0 ||
+        arivan_memory_checked_add(workspace_floats, (uint64_t)c->out_hidden,
+                                  &workspace_floats) != 0 ||
+        arivan_memory_checked_mul(workspace_floats, sizeof(float),
+                                  &layout->workspace_bytes) != 0)
+        return -1;
+#undef VISION_ADD_PRODUCT
+
+    if (layout->input_bytes > SIZE_MAX || layout->output_bytes > SIZE_MAX ||
+        layout->workspace_bytes > SIZE_MAX)
+        return -1;
+    layout->patch_tokens = (int)patch_tokens;
+    layout->output_tokens = (int)output_tokens;
+    return 0;
+}
+
+static float *vision_encode(GModel *m, const float *patches, size_t patch_floats,
                             int grid_h, int grid_w, int *out_tokens) {
     glm53_memory_set_phase(m, ARIVAN_PHASE_VISION);
     if (!m->has_vision) {
         fprintf(stderr, "this checkpoint does not include the vision tower\n");
         exit(1);
     }
-    const int tokens = coli_vision_output_tokens(&m->vision.config, grid_h, grid_w);
-    if (tokens <= 0) {
-        fprintf(stderr, "grid %dx%d is not divisible by merge size %d\n",
-                grid_h, grid_w, m->vision.config.merge);
+    const ColiVisionConfig *c = &m->vision.config;
+    VisionLayout layout;
+    if (vision_layout(c, grid_h, grid_w, &layout) != 0) {
+        fprintf(stderr, "invalid or overflowing vision layout for grid %dx%d\n",
+                grid_h, grid_w);
         exit(1);
     }
-    float *out = malloc((size_t)tokens * m->vision.config.out_hidden * sizeof(float));
+    const int tokens = layout.output_tokens;
+    uint64_t supplied_bytes = 0;
+    if (arivan_memory_checked_mul((uint64_t)patch_floats, sizeof(float),
+                                  &supplied_bytes) != 0 ||
+        supplied_bytes != layout.input_bytes) {
+        fprintf(stderr, "vision input has %zu floats, expected %llu for a %dx%d grid\n",
+                patch_floats,
+                (unsigned long long)(layout.input_bytes / sizeof(float)),
+                grid_h, grid_w);
+        exit(1);
+    }
+    if (m->memory_active && (uint32_t)tokens > m->memory_profile.vision_tokens) {
+        fprintf(stderr,
+                "[ARIVAN MEMORY] %s profile allows at most %u vision tokens; "
+                "this image requires %d\n",
+                m->memory_profile.name, m->memory_profile.vision_tokens, tokens);
+        exit(1);
+    }
+
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_VISION, layout.output_bytes,
+                                "vision embeddings");
+    glm53_memory_reserve_or_die(m, ARIVAN_MEM_WORKSPACE,
+                                layout.workspace_bytes, "vision forward workspace");
+    if (layout.workspace_bytes > m->vision_workspace_peak)
+        m->vision_workspace_peak = layout.workspace_bytes;
+
+    float *out = malloc((size_t)layout.output_bytes);
     if (!out) { fprintf(stderr, "OOM allocating vision embeddings\n"); exit(1); }
     if (coli_vision_forward(out, &m->vision, patches, grid_h, grid_w) != 0) {
         fprintf(stderr, "vision tower rejected the input\n");
         exit(1);
     }
+    glm53_memory_release_bytes(m, ARIVAN_MEM_WORKSPACE, layout.workspace_bytes);
+    if (m->memory_active &&
+        m->memory_budget.by_kind[ARIVAN_MEM_VISION_WINDOW] != 0) {
+        fprintf(stderr, "[ARIVAN MEMORY] vision weights remain live after encoding\n");
+        exit(1);
+    }
+    glm53_memory_report(m, "vision-complete");
     /* La torre esce a out_hidden; il flusso testuale vuole hidden. Il
      * checkpoint li dichiara uguali (4096) e il merger e' proprio il pezzo che
      * fa combaciare i due, quindi una differenza qui e' una config sbagliata,
@@ -2765,6 +3129,15 @@ static float *vision_encode(GModel *m, const float *patches,
     }
     *out_tokens = tokens;
     return out;
+}
+
+static void vision_embeddings_release(GModel *m, float *embeddings, int tokens) {
+    if (!embeddings) return;
+    free(embeddings);
+    glm53_memory_release_bytes(m, ARIVAN_MEM_VISION,
+                               (uint64_t)tokens * m->vision.config.out_hidden *
+                               sizeof(float));
+    glm53_memory_report(m, "vision-released");
 }
 
 /* ---------- sessione ---------- */
@@ -2980,25 +3353,14 @@ static void model_release(GModel *m) {
         free(m->ehit);
     }
     free(m->eref);
-    if (m->vblocks) {
-        for (int b = 0; b < m->c.vis_layers; b++) {
-            ColiVisionBlock *vb = &m->vblocks[b];
-            const float *parts[] = { vb->norm1, vb->norm2, vb->qkv_w, vb->qkv_b,
-                                     vb->q_norm, vb->k_norm, vb->proj_w, vb->proj_b,
-                                     vb->gate_w, vb->gate_b, vb->up_w, vb->up_b,
-                                     vb->down_w, vb->down_b };
-            for (size_t k = 0; k < sizeof(parts) / sizeof(*parts); k++)
-                free((void *)parts[k]);
-        }
-        free(m->vblocks);
-        const float *tower[] = { m->vision.patch_w, m->vision.patch_b,
-                                 m->vision.post_norm, m->vision.down_w,
-                                 m->vision.down_b, m->vision.merger_proj,
-                                 m->vision.merger_norm_w, m->vision.merger_norm_b,
-                                 m->vision.merger_gate, m->vision.merger_up,
-                                 m->vision.merger_down };
-        for (size_t k = 0; k < sizeof(tower) / sizeof(*tower); k++) free((void *)tower[k]);
-    }
+    if (m->vision_block_weights)
+        for (int b = 0; b < m->c.vis_layers; b++)
+            for (int k = 0; k < VB_COUNT; k++)
+                vision_weight_drop(m, &m->vision_block_weights[(size_t)b * VB_COUNT + k]);
+    for (int k = 0; k < VG_COUNT; k++)
+        vision_weight_drop(m, &m->vision_global[k]);
+    free(m->vision_block_weights);
+    free(m->vblocks);
     /* La testa puo' essere la tabella degli embedding: liberarla due volte
      * sarebbe un doppio free, non un risparmio. */
     if (m->head.f != m->embed) mat_release(&m->head);
@@ -3170,8 +3532,19 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     glm53_memory_set_phase(m, ARIVAN_PHASE_PREFILL);
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
-    int chunk = setting ? atoi(setting) : 128;
-    if (chunk < 1) chunk = 1;
+    int chunk = m->memory_active && m->memory_profile.prefill_chunk
+        ? (int)m->memory_profile.prefill_chunk : 128;
+    if (setting && *setting) {
+        char *end = NULL;
+        errno = 0;
+        const long requested = strtol(setting, &end, 10);
+        if (errno || end == setting || *end || requested < 1 || requested > INT_MAX) {
+            fprintf(stderr, "GLM53_PREFILL_CHUNK must be an integer in 1..%d\n",
+                    INT_MAX);
+            exit(2);
+        }
+        chunk = (int)requested;
+    }
     if (chunk > n) chunk = n;
 
     float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
@@ -3523,14 +3896,20 @@ static void slot_remember(KVSlot *slot, const int *tokens, int n) {
 typedef struct {
     unsigned long long id;
     float *patches;
+    size_t patch_floats;
+    uint64_t accounted_bytes;
     int grid_h, grid_w;
 } PendingImage;
 
-static PendingImage g_pending = {0, NULL, 0, 0};
+static PendingImage g_pending = {0, NULL, 0, 0, 0, 0};
 
-static void pending_clear(void) {
+static void pending_clear(GModel *m) {
     free(g_pending.patches);
+    glm53_memory_release_bytes(m, ARIVAN_MEM_VISION,
+                               g_pending.accounted_bytes);
     g_pending.patches = NULL;
+    g_pending.patch_floats = 0;
+    g_pending.accounted_bytes = 0;
     g_pending.id = 0;
 }
 
@@ -3597,9 +3976,20 @@ static void serve_data_lp(unsigned long long id, const char *text, int n,
     fflush(stdout);
 }
 
+static void serve_discard_frame(size_t bytes) {
+    unsigned char scratch[4096];
+    while (bytes) {
+        const size_t take = bytes < sizeof(scratch) ? bytes : sizeof(scratch);
+        const size_t got = fread(scratch, 1, take, stdin);
+        if (!got) return;
+        bytes -= got;
+    }
+    (void)fgetc(stdin);
+}
+
 /* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
  * righe: puo' contenerne. */
-static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
+static int serve_read_req(GModel *m, ServeReq *q, char *verb, size_t verb_size) {
     char header[512];
     if (!fgets(header, sizeof(header), stdin)) return 0;
     memset(q, 0, sizeof(*q));
@@ -3611,20 +4001,50 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     if (!strcmp(verb, "IMAGE")) {
         unsigned long long id; int bytes, grid_h, grid_w;
         if (sscanf(header, "IMAGE %llu %d %d %d", &id, &bytes, &grid_h, &grid_w) != 4 ||
-            bytes < 0 || bytes > (1 << 28) || grid_h < 1 || grid_w < 1) {
+            bytes <= 0 || bytes > (1 << 28) ||
+            bytes % (int)sizeof(float) != 0 || grid_h < 1 || grid_w < 1) {
             strcpy(verb, "BAD_FRAME");
             return 1;
         }
-        pending_clear();
-        float *patches = malloc((size_t)bytes);
-        if (!patches || fread(patches, 1, (size_t)bytes, stdin) != (size_t)bytes) {
-            free(patches);
+        VisionLayout layout;
+        if (!m->has_vision ||
+            vision_layout(&m->vision.config, grid_h, grid_w, &layout) != 0 ||
+            (uint64_t)bytes != layout.input_bytes) {
+            serve_discard_frame((size_t)bytes);
             strcpy(verb, "BAD_FRAME");
+            q->id = id;
+            return 1;
+        }
+        pending_clear(m);
+        if (m->memory_active && arivan_memory_reserve(
+                &m->memory_budget, ARIVAN_MEM_VISION, layout.input_bytes) != 0) {
+            serve_discard_frame((size_t)bytes);
+            strcpy(verb, "BAD_FRAME");
+            q->id = id;
+            return 1;
+        }
+        float *patches = malloc((size_t)bytes);
+        if (!patches) {
+            glm53_memory_release_bytes(m, ARIVAN_MEM_VISION,
+                                       layout.input_bytes);
+            serve_discard_frame((size_t)bytes);
+            strcpy(verb, "BAD_FRAME");
+            q->id = id;
+            return 1;
+        }
+        if (fread(patches, 1, (size_t)bytes, stdin) != (size_t)bytes) {
+            free(patches);
+            glm53_memory_release_bytes(m, ARIVAN_MEM_VISION,
+                                       layout.input_bytes);
+            strcpy(verb, "BAD_FRAME");
+            q->id = id;
             return 1;
         }
         (void)fgetc(stdin);                       /* il '\n' di chiusura */
         g_pending.id = id;
         g_pending.patches = patches;
+        g_pending.patch_floats = (size_t)bytes / sizeof(float);
+        g_pending.accounted_bytes = layout.input_bytes;
         g_pending.grid_h = grid_h;
         g_pending.grid_w = grid_w;
         q->id = id;
@@ -3728,11 +4148,11 @@ enum { SERVE_CTL_NONE = 0, SERVE_CTL_CANCEL = 1, SERVE_CTL_STOP = 2 };
  * Non legge MAI se stdin non e' pronto: una fgets bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai -- un
  * guasto peggiore di quello che questa funzione cura. */
-static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+static int serve_cancel_pending(GModel *m, unsigned long long id, int *input_eof) {
     int cancelled = 0, stopped = 0;
     while (coli_serve_stdin_ready()) {
         ServeReq n; char verb[16];
-        if (!serve_read_req(&n, verb, sizeof(verb))) { *input_eof = 1; break; }
+        if (!serve_read_req(m, &n, verb, sizeof(verb))) { *input_eof = 1; break; }
         if (!strcmp(verb, "CANCEL")) {
             if (n.id == id) cancelled = 1;
             else serve_line("ERROR %llu NOT_FOUND\n", n.id);
@@ -3831,7 +4251,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     int n_vision = 0;
     if (g_pending.patches && g_pending.id == q->id) {
         if (!m->has_vision) {
-            pending_clear();
+            pending_clear(m);
             free(sequence);
             serve_line("ERROR %llu BAD_REQUEST\n", q->id);
             return 0;
@@ -3841,9 +4261,10 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
             slot->session = session_open(m, room);
             shared = 0;
         }
-        vision = vision_encode(m, g_pending.patches, g_pending.grid_h,
+        vision = vision_encode(m, g_pending.patches, g_pending.patch_floats,
+                               g_pending.grid_h,
                                g_pending.grid_w, &n_vision);
-        pending_clear();
+        pending_clear(m);
     }
 
     const int reused = shared;
@@ -3856,6 +4277,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
     float *logits = forward_prefill(m, slot->session, sequence + shared,
                                     total - shared, vision, n_vision, 0);
+    vision_embeddings_release(m, vision, n_vision);
+    vision = NULL;
+    n_vision = 0;
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
     if (q->pin && logits &&
         !slot_pin_save(m, slot, sequence, total, logits) && getenv("GLM53_VERBOSE"))
@@ -3879,7 +4303,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
          * pagherebbe una select e una fgets a vuoto. Il turno finisce qui sotto
          * e il DONE parte lo stesso; e' serve_one a dire a serve_loop, col
          * valore di ritorno, che dopo non c'e' piu' nessuno. */
-        if (!input_eof) ctl = serve_cancel_pending(q->id, &input_eof);
+        if (!input_eof) ctl = serve_cancel_pending(m, q->id, &input_eof);
         if (ctl != SERVE_CTL_NONE) break;
         if (total >= room) { limited = 1; break; }
         const float *row = logits + (size_t)(rows - 1) * m->c.vocab;
@@ -3901,7 +4325,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         rows = 1;
     }
     free(logits);
-    free(vision);
+    vision_embeddings_release(m, vision, n_vision);
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
@@ -4043,7 +4467,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
-        if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
+        if (!serve_read_req(m, &q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
             /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato
              * servito per intero (e' la regola: "in-flight requests finish
@@ -4080,6 +4504,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
          * aspetti una risposta: il gateway manda STOP e poi continua a leggere
          * fino al DONE, non si mette in attesa di un ack. */
     }
+    pending_clear(m);
 }
 
 #ifndef GLM53_NO_MAIN
@@ -4189,23 +4614,44 @@ int main(int argc, char **argv) {
             fprintf(stderr, "--patches requested but this checkpoint does not include the vision tower\n");
             return 2;
         }
-        const size_t per_patch = (size_t)vc->in_channels * vc->temporal * vc->patch * vc->patch;
-        const size_t wanted = (size_t)grid_h * grid_w * per_patch;
+        VisionLayout patch_layout;
+        if (vision_layout(vc, grid_h, grid_w, &patch_layout) != 0) {
+            fprintf(stderr, "invalid or overflowing vision layout for grid %dx%d\n",
+                    grid_h, grid_w);
+            return 2;
+        }
+        const size_t wanted = (size_t)(patch_layout.input_bytes / sizeof(float));
         FILE *f = fopen(patch_file, "rb");
         if (!f) { fprintf(stderr, "cannot open %s\n", patch_file); return 2; }
-        float *patches = malloc(wanted * sizeof(float));
-        if (!patches) { fprintf(stderr, "OOM allocating patches\n"); return 2; }
+        glm53_memory_reserve_or_die(&model, ARIVAN_MEM_VISION,
+                                    patch_layout.input_bytes,
+                                    "vision input patches");
+        float *patches = malloc((size_t)patch_layout.input_bytes);
+        if (!patches) {
+            glm53_memory_release_bytes(&model, ARIVAN_MEM_VISION,
+                                       patch_layout.input_bytes);
+            fclose(f);
+            fprintf(stderr, "OOM allocating patches\n");
+            return 2;
+        }
         size_t got = fread(patches, sizeof(float), wanted, f);
         /* Una patch corta darebbe comunque un'uscita, con la coda letta da
          * memoria non inizializzata: meglio fermarsi e dire di quanto. */
-        if (got != wanted) {
+        const int trailing = got == wanted ? fgetc(f) : EOF;
+        if (got != wanted || trailing != EOF) {
             fprintf(stderr, "%s: got %zu floats, expected %zu for a %dx%d grid\n",
                     patch_file, got, wanted, grid_h, grid_w);
+            free(patches);
+            glm53_memory_release_bytes(&model, ARIVAN_MEM_VISION,
+                                       patch_layout.input_bytes);
+            fclose(f);
             return 2;
         }
         fclose(f);
-        vision = vision_encode(&model, patches, grid_h, grid_w, &n_vision);
+        vision = vision_encode(&model, patches, got, grid_h, grid_w, &n_vision);
         free(patches);
+        glm53_memory_release_bytes(&model, ARIVAN_MEM_VISION,
+                                   patch_layout.input_bytes);
         printf("vision_tokens %d\n", n_vision);
     }
 
@@ -4214,6 +4660,9 @@ int main(int argc, char **argv) {
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
     const double prefill_start = now_s();
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
+    vision_embeddings_release(&model, vision, n_vision);
+    vision = NULL;
+    n_vision = 0;
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "load %.1fs, prefill %d tokens in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
@@ -4285,9 +4734,10 @@ int main(int argc, char **argv) {
     free(logits);
     session_close(&model, session);
     glm53_telemetry_save();
-    rt_destroy();
-    free(vision);
+    vision_embeddings_release(&model, vision, n_vision);
     free(tokens);
+    model_release(&model);
+    rt_destroy();
     return 0;
 }
 #endif /* GLM53_NO_MAIN */

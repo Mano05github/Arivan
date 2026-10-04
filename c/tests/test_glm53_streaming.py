@@ -81,6 +81,10 @@ def main() -> int:
     staged = run(arguments.binary, arguments.quantized, patches, grid, budget="0")
     profiled = run(arguments.binary, arguments.quantized, patches, grid,
                    budget="0", profile="8gb")
+    text_only = {"ids": ",".join(str(t) for t in reference["prompt_ids"]),
+                 "file": None}
+    profiled_text = run(arguments.binary, arguments.quantized, text_only, grid,
+                        budget="0", profile="8gb")
 
     if "experts" not in wide or "experts" not in narrow or "experts" not in staged:
         print("FAIL: il motore non ha usato lo streaming sul contenitore int4")
@@ -114,7 +118,7 @@ def main() -> int:
     telemetry = profiled["_stderr"]
     for field in ("event=load-complete", "weights=", "vision=", "workspace=",
                   "embedding_window_peak_bytes=", "head_window_peak_bytes=",
-                  "dense_window_peak_bytes="):
+                  "dense_window_peak_bytes=", "vision_window_peak_bytes="):
         if field not in telemetry:
             print(f"FAIL: telemetria del profilo 8gb senza {field}")
             return 1
@@ -129,6 +133,11 @@ def main() -> int:
         if not values or max(values) <= 0.0:
             print(f"FAIL: il profilo 8gb non ha materializzato {field}")
             return 1
+    vision_peaks = [int(value) for value in re.findall(
+        r"vision_window_peak_bytes=([0-9]+)", profiled_text["_stderr"])]
+    if not vision_peaks or max(vision_peaks) != 0:
+        print("FAIL: il percorso solo testo ha materializzato pesi vision")
+        return 1
     closed = [line for line in telemetry.splitlines() if "event=session-close" in line]
     for field in ("embedding_window_bytes=0", "head_window_bytes=0",
                   "dense_window_bytes=0"):

@@ -17,8 +17,8 @@ interface, and a path toward low-memory model execution.
 
 > [!IMPORTANT]
 > The 8 GiB profile is currently an admission-control contract, not a claim
-> that GLM-5.3 Flash already runs within 8 GiB. Dense and vision paging are
-> the next engine milestones.
+> that GLM-5.3 Flash already runs within 8 GiB. The remaining engine milestone
+> is complete forward-workspace accounting and real-checkpoint certification.
 
 ## Current status
 
@@ -27,10 +27,11 @@ Version: `0.1.0.dev0`
 - Independent `arivan` command and Python package
 - Explicit 8, 16, and 32 GiB memory profiles
 - Native C hard-budget accounting by allocation category and runtime phase
-- Pre-allocation admission checks for resident text and vision tensors
+- Pre-allocation admission checks for text tensors and vision activations
 - Load-time quantization peak accounting, including temporary f32 buffers
 - Synchronous one-layer dense paging under native memory profiles
 - Row-windowed token embeddings and chunked output-head projection
+- Stage-paged GLM vision weights with profile-specific image-token limits
 - GLM-5.3 Flash load-peak measurement and expert-cache admission control
 - Zero-cache GLM-5.3 expert execution through bounded reusable staging slots
 - Opt-in phase telemetry with `ARIVAN_MEMORY_TELEMETRY=1`
@@ -42,8 +43,8 @@ Version: `0.1.0.dev0`
 Arivan currently refuses unsafe low-memory configurations instead of allowing
 the process to overcommit and fail later. The expert-cache floor has been
 removed, dense layer matrices use a synchronous bounded window, and global
-embedding/head tensors are paged. Vision residency and forward workspaces are
-the principal remaining 8 GiB blockers.
+embedding/head tensors and vision stages are paged. General text-forward
+workspaces are the principal remaining 8 GiB blocker.
 
 The native runtime currently includes adapters for GLM-5.3-Flash,
 GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6, Qwen3.8-Flash-Next,
@@ -124,12 +125,11 @@ delivery sequence, and GLM-5.3 Flash acceptance gates.
 The next development milestone is correct GLM-5.3 Flash text generation below
 the 8 GiB profile's 5.25 GiB engine ceiling:
 
-1. Load and release vision weights by runtime phase.
-2. Account and bound every forward workspace.
-3. Add bounded asynchronous prefetch to the synchronous dense-layer window.
-4. Replace equal per-layer pinning with a global byte-budgeted cache.
-5. Restore int8 MTP depth one and enable it only when it improves net speed.
-6. Validate tokens, memory peaks, SSD traffic, vision, tools, and MTP.
+1. Account and bound every text-forward workspace.
+2. Add bounded asynchronous prefetch to the synchronous dense-layer window.
+3. Replace equal per-layer pinning with a global byte-budgeted cache.
+4. Restore int8 MTP depth one and enable it only when it improves net speed.
+5. Validate tokens, memory peaks, SSD traffic, vision, tools, and MTP.
 
 Later releases will add repository tools and multiple logical agents sharing
 one serialized model process. Arivan does not promise identical performance at

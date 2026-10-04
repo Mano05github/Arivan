@@ -57,6 +57,23 @@ class ArivanGlm53SourceTest(unittest.TestCase):
         self.assertIn("output_head_apply(m, logits, normed, n)", SOURCE)
         self.assertIn("mat_materialize_rows", SOURCE)
 
+    def test_profile_pages_vision_by_execution_stage(self):
+        self.assertIn("ARIVAN_MEM_VISION_WINDOW", SOURCE)
+        self.assertIn("vision_stage_acquire", SOURCE)
+        self.assertIn("vision_stage_release", SOURCE)
+        self.assertIn("COLI_VISION_STAGE_BLOCK", SOURCE)
+        self.assertIn("COLI_VISION_STAGE_MERGER_GATE", SOURCE)
+        self.assertIn("m->memory_profile.vision_tokens", SOURCE)
+        self.assertIn('glm53_memory_report(m, "vision-complete")', SOURCE)
+        self.assertIn('glm53_memory_report(m, "vision-released")', SOURCE)
+        self.assertIn("stage_bytes > arivan_memory_available", SOURCE)
+        self.assertIn("vision_layout", SOURCE)
+        self.assertIn("g_pending.patch_floats", SOURCE)
+
+    def test_profile_controls_the_default_prefill_chunk(self):
+        self.assertIn("m->memory_profile.prefill_chunk", SOURCE)
+        self.assertIn("GLM53_PREFILL_CHUNK must be an integer", SOURCE)
+
     def test_every_glm53_link_path_includes_native_memory_module(self):
         self.assertIn("glm53: glm53$(EXE)", MAKEFILE)
         self.assertIn("$(SEGMENT_BUILD_DIR)/arivan_memory.o", MAKEFILE)
